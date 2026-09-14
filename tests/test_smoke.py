@@ -1,3 +1,5 @@
+import pytest
+from database.policy_ast import parse_policy_expression
 """Tests for the direct snapshot reader."""
 
 import struct
@@ -216,3 +218,23 @@ def test_invalid_snapshot_is_rejected(tmp_path):
         assert False
     except ValueError:
         pass
+
+@pytest.mark.parametrize(
+    ("expression", "expected_names"),
+    [
+        ("department = 'IT'::text", ["Bob", "Eve"]),
+        ("department = 'HR'::text", ["Alice", "Carol"]),
+        ("department = 'Finance'::text", ["David"]),
+    ],
+)
+def test_database_ast_integrates_with_reader(
+    tmp_path, expression, expected_names
+):
+    snapshot = tmp_path / "employees.bin"
+    create_test_snapshot(snapshot)
+
+    policy = parse_policy_expression(expression)
+
+    rows = read_snapshot(str(snapshot), policy)
+
+    assert [row["name"] for row in rows] == expected_names
