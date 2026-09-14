@@ -1,6 +1,9 @@
+import os
+
 from database.policy_ast import (
     PolicyParseError,
     build_policy_map,
+    extract_policies_from_database,
     parse_policy_expression,
 )
 
@@ -126,3 +129,41 @@ def test_unsupported_policy_raises_error():
         pass
     else:
         raise AssertionError("Unsupported policy should raise PolicyParseError")
+
+
+def test_extract_policies_from_database():
+    password = os.getenv("PGPASSWORD")
+
+    if not password:
+        import pytest
+
+        pytest.skip("PGPASSWORD is not set")
+
+    result = extract_policies_from_database(
+        host=os.getenv("PGHOST", "localhost"),
+        port=int(os.getenv("PGPORT", "5432")),
+        database=os.getenv("PGDATABASE", "policy_reader"),
+        user=os.getenv("PGUSER", "postgres"),
+        password=password,
+    )
+
+    assert result == {
+        "it_user": {
+            "type": "comparison",
+            "column": "department",
+            "operator": "=",
+            "value": "IT",
+        },
+        "hr_user": {
+            "type": "comparison",
+            "column": "department",
+            "operator": "=",
+            "value": "HR",
+        },
+        "finance_user": {
+            "type": "comparison",
+            "column": "department",
+            "operator": "=",
+            "value": "Finance",
+        },
+    }
