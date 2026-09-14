@@ -1,16 +1,19 @@
 """
-Benchmark and correctness utilities for the
-Policy-Aware Direct Snapshot Reader project.
+Integrated benchmark and correctness harness.
 
-This module currently provides:
-- PostgreSQL baseline execution
-- result normalization
-- soundness/completeness checks
-- latency measurement
-- benchmark statistics
+Project paths:
+    PostgreSQL DBMS baseline
+        vs.
+    Direct snapshot reader
 
-The direct-reader integration will be connected once
-reader/snapshot_reader.py is available on the integrated branch.
+The module:
+- connects to PostgreSQL,
+- executes the baseline query under an RLS role,
+- extracts the project's Policy AST,
+- exports a real PostgreSQL binary COPY snapshot,
+- runs Ishaan's direct reader,
+- compares result sets using soundness/completeness,
+- measures latency and standard deviation.
 """
 
 from __future__ import annotations
@@ -19,21 +22,20 @@ import os
 import statistics
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import psycopg
 from psycopg import sql
 
+from database.policy_ast import extract_policies_from_database
+from reader.snapshot_reader import read_snapshot
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+from typing import Any, Callable, Iterable, cast
 
-DEFAULT_QUERY = """
-SELECT id, name, department, salary
-FROM employees
-ORDER BY id;
-""".strip()
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SNAPSHOT_PATH = PROJECT_ROOT / "data" / "employees.bin"
 
 SUPPORTED_ROLES = (
     "it_user",
@@ -41,15 +43,15 @@ SUPPORTED_ROLES = (
     "finance_user",
 )
 
+DEFAULT_QUERY = """
+SELECT id, name, department, salary
+FROM employees
+ORDER BY id;
+""".strip()
 
-# ---------------------------------------------------------------------------
-# Result data structures
-# ---------------------------------------------------------------------------
 
 @dataclass
 class CorrectnessResult:
-    """Result of comparing PostgreSQL and direct-reader outputs."""
-
     soundness: bool
     completeness: bool
     results_match: bool
@@ -59,60 +61,60 @@ class CorrectnessResult:
 
 @dataclass
 class BenchmarkStats:
-    """Timing statistics for one execution path."""
-
     samples_ms: list[float]
     average_ms: float
     standard_deviation_ms: float
 
 
-# ---------------------------------------------------------------------------
-# PostgreSQL connection
-# ---------------------------------------------------------------------------
-
-def get_connection() -> psycopg.Connection:
-    """
-    Create a PostgreSQL connection using environment variables.
-
-    Expected environment variables:
-
-        PGHOST      default: localhost
-        PGPORT      default: 5432
-        PGDATABASE  default: direct_reader_db
-        PGUSER      default: postgres
-        PGPASSWORD  required
-
-    The password must never be committed to Git.
-    """
+def _get_connection_kwargs() -> dict[str, Any]:
+    """Read PostgreSQL connection settings from environment variables."""
     password = os.getenv("PGPASSWORD")
-
     if not password:
         raise RuntimeError(
-            "PGPASSWORD is not set. "
-            "Set your PostgreSQL password in the current shell "
-            "before running the benchmark."
+            "PGPASSWORD is not set. Set it in the current terminal "
+            "before running the project."
         )
 
-    return psycopg.connect(
-        host=os.getenv("PGHOST", "localhost"),
-        port=int(os.getenv("PGPORT", "5432")),
-        dbname=os.getenv("PGDATABASE", "direct_reader_db"),
-        user=os.getenv("PGUSER", "postgres"),
-        password=password,
-    )
+    return {
+        "host": os.getenv("PGHOST", "localhost"),
+        "port": int(os.getenv("PGPORT", "5432")),
+        "dbname": os.getenv("PGDATABASE", "direct_reader_db"),
+        "user": os.getenv("PGUSER", "postgres"),
+        "password": password,
+    }
 
 
-# ---------------------------------------------------------------------------
-# PostgreSQL baseline
-# ---------------------------------------------------------------------------
+def get_connection() -> psycopg.Connection:
+    """Create a connection to the project's PostgreSQL database."""
+    return psycopg.connect(**_get_connection_kwargs())
+
 
 def _validate_role(role: str) -> None:
-    """Validate that the requested role is part of the project contract."""
     if role not in SUPPORTED_ROLES:
         raise ValueError(
-            f"Unsupported role: {role!r}. "
+            f"Unsupported role {role!r}. "
             f"Expected one of: {', '.join(SUPPORTED_ROLES)}"
         )
+
+
+def _execute_postgres_query(
+    connection: psycopg.Connection,
+    query: str,
+) -> list[dict[str, Any]]:
+    """Execute a query on an already-role-scoped PostgreSQL connection."""
+    with connection.cursor() as cursor:
+        cursor.execute(cast(Any, query))
+        rows = cursor.fetchall()
+        if cursor.description is None:
+            raise RuntimeError(
+                "PostgreSQL query did not return column metadata."
+            )
+        column_names = [description.name for description in cursor.description]
+
+    return [
+        {column: value for column, value in zip(column_names, row)}
+        for row in rows
+    ]
 
 
 def run_postgres_query(
@@ -120,98 +122,40 @@ def run_postgres_query(
     query: str = DEFAULT_QUERY,
 ) -> list[dict[str, Any]]:
     """
-    Execute the baseline query through PostgreSQL under the requested role.
+    Execute the DBMS baseline under the requested RLS role.
 
-    PostgreSQL remains the correctness baseline.
-
-    We connect as the postgres administrative user and temporarily use
-    SET ROLE so PostgreSQL evaluates the query under the project's
-    non-administrative RLS role.
-
-    Parameters
-    ----------
-    role:
-        One of it_user, hr_user, finance_user.
-
-    query:
-        Read-only SQL query against employees.
-
-    Returns
-    -------
-    list[dict[str, Any]]
-        Rows normalized to the project's standard row representation.
+    The connection is created as postgres and then SET ROLE is used so the
+    query is evaluated with the project's restricted role.
     """
     _validate_role(role)
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            # PostgreSQL identifiers cannot safely be inserted into SQL
-            # using normal string interpolation. psycopg.sql.Identifier()
-            # safely quotes the role name.
-            cur.execute(
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
                 sql.SQL("SET ROLE {}").format(sql.Identifier(role))
             )
 
-            cur.execute(query)
-
-            rows = cur.fetchall()
-
-            column_names = [desc.name for desc in cur.description]
-
-            # Restore the original role before leaving the connection.
-            cur.execute("RESET ROLE")
-
-    return [
-        {
-            column: value
-            for column, value in zip(column_names, row)
-        }
-        for row in rows
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Result normalization
-# ---------------------------------------------------------------------------
-
-EXPECTED_COLUMNS = (
-    "id",
-    "name",
-    "department",
-    "salary",
-)
+        return _execute_postgres_query(connection, query)
 
 
 def normalize_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Normalize rows into the canonical project representation.
-
-    Rows are sorted by id so that comparisons do not depend on
-    incidental result ordering.
-    """
-    normalized: list[dict[str, Any]] = []
-
-    for row in rows:
-        normalized_row = {
+    """Convert rows into the canonical project representation and sort by id."""
+    normalized = [
+        {
             "id": row["id"],
             "name": row["name"],
             "department": row["department"],
             "salary": row["salary"],
         }
-        normalized.append(normalized_row)
-
-    normalized.sort(key=lambda item: item["id"])
+        for row in rows
+    ]
+    normalized.sort(key=lambda row: row["id"])
     return normalized
 
-
-# ---------------------------------------------------------------------------
-# Correctness
-# ---------------------------------------------------------------------------
 
 def _rows_by_id(
     rows: Iterable[dict[str, Any]],
 ) -> dict[Any, dict[str, Any]]:
-    """Index normalized rows by primary key."""
     return {row["id"]: row for row in rows}
 
 
@@ -220,22 +164,15 @@ def compare_results(
     reader_rows: Iterable[dict[str, Any]],
 ) -> CorrectnessResult:
     """
-    Compare direct-reader output with PostgreSQL output.
+    Compare direct-reader output against the PostgreSQL baseline.
 
-    Definitions used by the project:
+    Soundness:
+        reader_rows is a subset of postgres_rows.
 
-        Soundness:
-            every row returned by the direct reader is also
-            authorized according to PostgreSQL.
+    Completeness:
+        postgres_rows is a subset of reader_rows.
 
-        Completeness:
-            every row returned by PostgreSQL is also returned
-            by the direct reader.
-
-        Results match:
-            both soundness and completeness hold.
-
-    PostgreSQL is treated as the baseline/oracle.
+    Results match only when both conditions hold.
     """
     postgres = normalize_rows(postgres_rows)
     reader = normalize_rows(reader_rows)
@@ -247,7 +184,6 @@ def compare_results(
         postgres_map[row_id]
         for row_id in sorted(set(postgres_map) - set(reader_map))
     ]
-
     reader_only = [
         reader_map[row_id]
         for row_id in sorted(set(reader_map) - set(postgres_map))
@@ -255,20 +191,87 @@ def compare_results(
 
     soundness = len(reader_only) == 0
     completeness = len(postgres_only) == 0
-    results_match = soundness and completeness
 
     return CorrectnessResult(
         soundness=soundness,
         completeness=completeness,
-        results_match=results_match,
+        results_match=soundness and completeness,
         postgres_only_rows=postgres_only,
         reader_only_rows=reader_only,
     )
 
 
-# ---------------------------------------------------------------------------
-# Benchmarking
-# ---------------------------------------------------------------------------
+def load_policy_map() -> dict[str, dict]:
+    """
+    Extract the real PostgreSQL RLS policies and convert them to the
+    project's canonical policy AST map.
+    """
+    kwargs = _get_connection_kwargs()
+
+    return extract_policies_from_database(
+        host=kwargs["host"],
+        port=kwargs["port"],
+        database=kwargs["dbname"],
+        user=kwargs["user"],
+        password=kwargs["password"],
+    )
+
+
+def get_policy_for_role(role: str) -> dict:
+    """Return the parsed policy AST for one supported project role."""
+    _validate_role(role)
+
+    policies = load_policy_map()
+
+    try:
+        return policies[role]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"No PostgreSQL RLS policy was extracted for role {role!r}."
+        ) from exc
+
+
+def export_binary_snapshot(
+    snapshot_path: str | Path = DEFAULT_SNAPSHOT_PATH,
+) -> Path:
+    """
+    Export the employees table using PostgreSQL's native binary COPY format.
+
+    psycopg COPY TO STDOUT is used so PostgreSQL writes the binary stream
+    to the local file under the Python process's permissions.
+    """
+    snapshot_path = Path(snapshot_path)
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+
+    copy_command = """
+        COPY employees TO STDOUT WITH (FORMAT binary)
+    """
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            with cursor.copy(copy_command) as copy:
+                with snapshot_path.open("wb") as output_file:
+                    while True:
+                        chunk = copy.read()
+                        if not chunk:
+                            break
+                        output_file.write(chunk)
+
+    return snapshot_path
+
+
+def run_direct_reader(
+    role: str,
+    snapshot_path: str | Path = DEFAULT_SNAPSHOT_PATH,
+) -> list[dict[str, Any]]:
+    """Extract the role policy and run Ishaan's direct reader."""
+    policy = get_policy_for_role(role)
+
+    return read_snapshot(
+        str(snapshot_path),
+        policy,
+    )
+
 
 def benchmark_callable(
     function: Callable[[], Any],
@@ -276,21 +279,13 @@ def benchmark_callable(
     warmup_runs: int = 3,
     measured_runs: int = 10,
 ) -> BenchmarkStats:
-    """
-    Measure a callable repeatedly.
-
-    Warm-up executions are excluded from the reported measurements.
-
-    Timing uses time.perf_counter(), which is appropriate for measuring
-    elapsed wall-clock duration in Python.
-    """
+    """Measure a callable repeatedly using wall-clock time."""
     if warmup_runs < 0:
         raise ValueError("warmup_runs must be >= 0")
 
     if measured_runs <= 0:
         raise ValueError("measured_runs must be > 0")
 
-    # Warm-up.
     for _ in range(warmup_runs):
         function()
 
@@ -299,14 +294,11 @@ def benchmark_callable(
     for _ in range(measured_runs):
         start = time.perf_counter()
         function()
-        end = time.perf_counter()
-
-        elapsed_ms = (end - start) * 1000.0
-        samples_ms.append(elapsed_ms)
+        elapsed = (time.perf_counter() - start) * 1000.0
+        samples_ms.append(elapsed)
 
     average_ms = statistics.mean(samples_ms)
 
-    # statistics.stdev() requires at least two samples.
     if len(samples_ms) >= 2:
         standard_deviation_ms = statistics.stdev(samples_ms)
     else:
@@ -323,48 +315,121 @@ def calculate_speedup(
     postgres_average_ms: float,
     reader_average_ms: float,
 ) -> float:
-    """
-    Calculate direct-reader speedup relative to PostgreSQL.
-
-    speedup = PostgreSQL average / reader average
-
-    > 1 means the direct reader is faster.
-    = 1 means approximately equal.
-    < 1 means the direct reader is slower.
-    """
+    """Return PostgreSQL average latency divided by reader latency."""
     if reader_average_ms <= 0:
         raise ValueError("reader_average_ms must be greater than zero")
 
     return postgres_average_ms / reader_average_ms
 
 
-# ---------------------------------------------------------------------------
-# PostgreSQL baseline demonstration
-# ---------------------------------------------------------------------------
-
-def demo_postgres(role: str = "it_user") -> None:
+def benchmark_role(
+    role: str,
+    *,
+    snapshot_path: str | Path = DEFAULT_SNAPSHOT_PATH,
+    warmup_runs: int = 3,
+    measured_runs: int = 10,
+) -> dict[str, Any]:
     """
-    Small command-line demonstration of the PostgreSQL baseline.
+    Run one complete benchmark case for a role.
 
-    This is intentionally useful before the direct reader is integrated.
+    Policy extraction is performed before the timed region.
+    PostgreSQL and reader results are also validated before timing.
     """
-    print("=" * 60)
-    print("POSTGRESQL BASELINE")
-    print("=" * 60)
+    _validate_role(role)
+    snapshot_path = Path(snapshot_path)
+
+    if not snapshot_path.exists():
+        export_binary_snapshot(snapshot_path)
+
+    policy = get_policy_for_role(role)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL("SET ROLE {}").format(sql.Identifier(role))
+            )
+
+        postgres_rows = _execute_postgres_query(connection, DEFAULT_QUERY)
+
+        reader_rows = read_snapshot(
+            str(snapshot_path),
+            policy,
+        )
+
+        correctness = compare_results(postgres_rows, reader_rows)
+
+        postgres_stats = benchmark_callable(
+            lambda: _execute_postgres_query(connection, DEFAULT_QUERY),
+            warmup_runs=warmup_runs,
+            measured_runs=measured_runs,
+        )
+
+        reader_stats = benchmark_callable(
+            lambda: read_snapshot(str(snapshot_path), policy),
+            warmup_runs=warmup_runs,
+            measured_runs=measured_runs,
+        )
+
+    speedup = calculate_speedup(
+        postgres_stats.average_ms,
+        reader_stats.average_ms,
+    )
+
+    return {
+        "role": role,
+        "postgres_rows": postgres_rows,
+        "reader_rows": reader_rows,
+        "correctness": correctness,
+        "postgres_stats": postgres_stats,
+        "reader_stats": reader_stats,
+        "speedup": speedup,
+    }
+
+
+def main() -> None:
+    """Small command-line smoke test."""
+    role = "it_user"
+
+    print("=" * 70)
+    print("POLICY-AWARE DIRECT READER - INTEGRATED SMOKE TEST")
+    print("=" * 70)
+
+    snapshot = export_binary_snapshot()
+    print(f"Snapshot: {snapshot}")
+
+    result = benchmark_role(
+        role,
+        warmup_runs=1,
+        measured_runs=3,
+    )
+
+    correctness: CorrectnessResult = result["correctness"]
+    postgres_stats: BenchmarkStats = result["postgres_stats"]
+    reader_stats: BenchmarkStats = result["reader_stats"]
+
     print(f"Role: {role}")
-    print(f"Query: {DEFAULT_QUERY}")
     print()
-
-    rows = run_postgres_query(role)
-
-    print("Rows returned by PostgreSQL:")
-    for row in rows:
+    print("PostgreSQL result:")
+    for row in result["postgres_rows"]:
         print(row)
 
     print()
-    print(f"Rows returned: {len(rows)}")
-    print("=" * 60)
+    print("Direct reader result:")
+    for row in result["reader_rows"]:
+        print(row)
+
+    print()
+    print(f"Soundness:       {'PASS' if correctness.soundness else 'FAIL'}")
+    print(f"Completeness:    {'PASS' if correctness.completeness else 'FAIL'}")
+    print(f"Results match:   {'YES' if correctness.results_match else 'NO'}")
+
+    print()
+    print(f"PostgreSQL avg:  {postgres_stats.average_ms:.3f} ms")
+    print(f"PostgreSQL std:  {postgres_stats.standard_deviation_ms:.3f} ms")
+    print(f"Reader avg:      {reader_stats.average_ms:.3f} ms")
+    print(f"Reader std:      {reader_stats.standard_deviation_ms:.3f} ms")
+    print(f"Speedup:         {result['speedup']:.3f}x")
 
 
 if __name__ == "__main__":
-    demo_postgres("it_user")
+    main()

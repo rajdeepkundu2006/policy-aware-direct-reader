@@ -142,7 +142,7 @@ def test_extract_policies_from_database():
     result = extract_policies_from_database(
         host=os.getenv("PGHOST", "localhost"),
         port=int(os.getenv("PGPORT", "5432")),
-        database=os.getenv("PGDATABASE", "policy_reader"),
+        database=os.getenv("PGDATABASE", "direct_reader_db"),
         user=os.getenv("PGUSER", "postgres"),
         password=password,
     )

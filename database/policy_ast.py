@@ -118,7 +118,7 @@ def build_policy_map(policy_rows: list[dict]) -> dict:
 def extract_policies_from_database(
     host: str = "localhost",
     port: int = 5432,
-    database: str = "policy_reader",
+    database: str = "direct_reader_db",
     user: str = "postgres",
     password: str | None = None,
 ) -> dict:
