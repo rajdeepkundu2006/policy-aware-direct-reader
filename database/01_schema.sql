@@ -1,0 +1,3 @@
+-- TODO: Create the demo table and load initial sample data.
+-- Keep the first schema simple: one table, a small number of attributes,
+-- and at least one policy-relevant attribute such as department.

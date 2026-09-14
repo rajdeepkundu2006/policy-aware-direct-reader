@@ -1,0 +1,4 @@
+-- TODO: Enable row-level security and create demo roles/policies.
+-- Start with simple supported policies such as:
+-- USING (department = 'IT')
+-- USING (department = 'HR')
