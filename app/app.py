@@ -1,26 +1,3 @@
-"""
-Streamlit demonstration UI for the
-Policy-Aware Direct Snapshot Reader project.
-
-The application demonstrates two execution paths:
-
-1. Conventional PostgreSQL DBMS path
-   SQL -> PostgreSQL -> RLS -> result
-
-2. Direct-reader path
-   employees.bin -> Python parser -> policy evaluation -> result
-
-The UI compares:
-- PostgreSQL result
-- Direct-reader result
-- Soundness
-- Completeness
-- Result equality
-- Average latency
-- Standard deviation
-- Speedup
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -30,15 +7,10 @@ import pandas as pd
 import streamlit as st
 
 
-# ---------------------------------------------------------------------------
-# Project-root import setup
-# ---------------------------------------------------------------------------
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
 
 from benchmark.benchmark import (  # noqa: E402
     DEFAULT_QUERY,
@@ -52,137 +24,205 @@ from benchmark.benchmark import (  # noqa: E402
 )
 
 
-# ---------------------------------------------------------------------------
-# Page configuration
-# ---------------------------------------------------------------------------
-
 st.set_page_config(
     page_title="Policy-Aware Direct Snapshot Reader",
     page_icon="DB",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
+st.markdown(
+    """
+    <style>
+    .hero-title {
+        font-size: 2.25rem;
+        font-weight: 700;
+        margin-bottom: 0.2rem;
+    }
 
-st.title("Policy-Aware Direct Snapshot Reader")
+    .hero-subtitle {
+        font-size: 1rem;
+        opacity: 0.78;
+        margin-bottom: 1rem;
+    }
 
-st.write(
-    "Experimental comparison between the conventional PostgreSQL "
-    "DBMS execution path and the policy-aware direct snapshot reader."
+    .path-card {
+        border: 1px solid rgba(128,128,128,0.22);
+        border-radius: 12px;
+        padding: 1rem 1.1rem;
+        min-height: 135px;
+        background: rgba(128,128,128,0.035);
+    }
+
+    .path-title {
+        font-size: 1.15rem;
+        font-weight: 650;
+        margin-bottom: 0.45rem;
+    }
+
+    .path-flow {
+        font-family: monospace;
+        font-size: 0.88rem;
+        line-height: 1.55;
+        white-space: pre-line;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+st.markdown(
+    """
+    <div>
+        <div class="hero-title">Policy-Aware Direct Snapshot Reader</div>
+        <div class="hero-subtitle">
+            PostgreSQL DBMS path vs. direct snapshot reader
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 st.info(
-    "Current prototype scope: one table, read-only queries, "
-    "PostgreSQL binary COPY snapshot, and supported row-level policies."
+    "Research prototype: a read-only direct reader operates on a frozen "
+    "PostgreSQL binary snapshot while applying the database's supported "
+    "row-level security policy."
 )
 
 
-# ---------------------------------------------------------------------------
-# Sidebar / experiment configuration
-# ---------------------------------------------------------------------------
-
-st.sidebar.header("Experiment Configuration")
+# Sidebar
+st.sidebar.header("Experiment")
 
 role = st.sidebar.selectbox(
-    "Select role",
+    "User role",
     SUPPORTED_ROLES,
     format_func=lambda value: value.replace("_", " ").title(),
-)
-
-measured_runs = st.sidebar.number_input(
-    "Measured benchmark runs",
-    min_value=1,
-    max_value=30,
-    value=10,
-    step=1,
 )
 
 warmup_runs = st.sidebar.number_input(
     "Warm-up runs",
     min_value=0,
-    max_value=10,
+    max_value=20,
     value=3,
     step=1,
 )
 
+measured_runs = st.sidebar.number_input(
+    "Measured runs",
+    min_value=1,
+    max_value=50,
+    value=10,
+    step=1,
+)
+
 st.sidebar.markdown("---")
-st.sidebar.write("Snapshot")
+st.sidebar.caption("Snapshot")
 
 if DEFAULT_SNAPSHOT_PATH.exists():
-    st.sidebar.success("employees.bin exists")
+    st.sidebar.success("employees.bin is available")
 else:
-    st.sidebar.warning("employees.bin not created yet")
+    st.sidebar.warning("employees.bin has not been created")
 
 
-# ---------------------------------------------------------------------------
+# Architecture
+st.subheader("How the two paths differ")
+
+path_col1, path_col2 = st.columns(2)
+
+with path_col1:
+    st.markdown(
+        """
+        <div class="path-card">
+            <div class="path-title">PostgreSQL DBMS Path</div>
+            <div class="path-flow">
+            SQL query
+                ↓
+            PostgreSQL engine
+                ↓
+            RLS enforcement
+                ↓
+            Authorized result
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with path_col2:
+    st.markdown(
+        """
+        <div class="path-card">
+            <div class="path-title">Direct Reader Path</div>
+            <div class="path-flow">
+            employees.bin
+                ↓
+            Binary parser
+                ↓
+            Policy evaluator
+                ↓
+            Authorized result
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # Query
-# ---------------------------------------------------------------------------
+st.subheader("Read Request")
 
-st.subheader("Logical Query")
+st.code(DEFAULT_QUERY, language="sql")
 
-st.code(
-    DEFAULT_QUERY,
-    language="sql",
-)
+query_col1, query_col2 = st.columns(2)
 
-st.caption(
-    "The same logical read is evaluated through PostgreSQL and through "
-    "the direct reader for comparison."
-)
+with query_col1:
+    st.write(f"**Role:** `{role}`")
+
+with query_col2:
+    st.write("**Table:** `employees`")
 
 
-# ---------------------------------------------------------------------------
-# Buttons
-# ---------------------------------------------------------------------------
+# Actions
+action_col1, action_col2 = st.columns(2)
 
-button_col1, button_col2 = st.columns(2)
-
-with button_col1:
-    create_snapshot_button = st.button(
-        "Create / Refresh Binary Snapshot",
+with action_col1:
+    refresh_clicked = st.button(
+        "Create / Refresh Snapshot",
         use_container_width=True,
     )
 
-with button_col2:
-    run_button = st.button(
+with action_col2:
+    run_clicked = st.button(
         "Run Full Comparison",
         type="primary",
         use_container_width=True,
     )
 
 
-# ---------------------------------------------------------------------------
-# Snapshot creation
-# ---------------------------------------------------------------------------
-
-if create_snapshot_button:
+if refresh_clicked:
     try:
-        with st.spinner("Creating PostgreSQL binary snapshot..."):
-            snapshot_path = export_binary_snapshot()
+        with st.spinner("Exporting PostgreSQL binary snapshot..."):
+            snapshot = export_binary_snapshot(DEFAULT_SNAPSHOT_PATH)
 
-        st.success(
-            f"Binary snapshot created successfully: {snapshot_path}"
-        )
+        st.success(f"Snapshot ready: {snapshot}")
 
     except Exception as exc:
-        st.error("Binary snapshot creation failed.")
-
-        with st.expander("Show error details"):
+        st.error("Snapshot export failed.")
+        with st.expander("Technical details"):
             st.exception(exc)
 
 
-# ---------------------------------------------------------------------------
-# Full experiment
-# ---------------------------------------------------------------------------
-
-if run_button:
+if run_clicked:
     try:
+        if not DEFAULT_SNAPSHOT_PATH.exists():
+            with st.spinner("Creating binary snapshot..."):
+                export_binary_snapshot(DEFAULT_SNAPSHOT_PATH)
+
         with st.spinner(
             "Running PostgreSQL baseline, direct reader, "
-            "correctness check, and benchmark..."
+            "correctness checks, and timing..."
         ):
             result = benchmark_role(
                 role,
@@ -197,77 +237,31 @@ if run_button:
         st.success("Experiment completed successfully.")
 
     except Exception as exc:
-        st.error("The experiment failed.")
-
-        with st.expander("Show error details"):
+        st.error("The experiment could not be completed.")
+        with st.expander("Technical details"):
             st.exception(exc)
 
-
-# ---------------------------------------------------------------------------
-# Display result
-# ---------------------------------------------------------------------------
 
 result = st.session_state.get("benchmark_result")
 
 
-# ---------------------------------------------------------------------------
-# Initial state
-# ---------------------------------------------------------------------------
-
 if result is None:
     st.divider()
-
-    st.subheader("Ready for Demonstration")
-
+    st.subheader("Ready for demonstration")
     st.write(
-        "Select a role from the sidebar and click "
-        "**Run Full Comparison**."
+        "Choose a role, then click **Run Full Comparison**. "
+        "The application will show both execution paths, the active policy, "
+        "correctness, and measured latency."
     )
-
-    st.markdown(
-        """
-### What the application demonstrates
-
-**PostgreSQL DBMS path**
-
-SQL query  
-↓  
-PostgreSQL  
-↓  
-RLS enforcement  
-↓  
-Authorized rows
-
-**Direct-reader path**
-
-employees.bin  
-↓  
-Python binary parser  
-↓  
-Policy evaluator  
-↓  
-Authorized rows
-
-The two results are then compared for correctness and timed for performance.
-"""
-    )
-
-
-# ---------------------------------------------------------------------------
-# Result state
-# ---------------------------------------------------------------------------
 
 else:
     correctness: CorrectnessResult = result["correctness"]
     postgres_stats: BenchmarkStats = result["postgres_stats"]
     reader_stats: BenchmarkStats = result["reader_stats"]
 
-    # =======================================================================
-    # Experiment configuration
-    # =======================================================================
-
     st.divider()
 
+    # Experiment summary
     st.subheader("Experiment Configuration")
 
     config_col1, config_col2, config_col3 = st.columns(3)
@@ -287,168 +281,106 @@ else:
         "employees.bin",
     )
 
-    # =======================================================================
-    # Active policy
-    # =======================================================================
-
+    # Policy
     st.subheader("Active Row-Level Security Policy")
 
     try:
         policy = get_policy_for_role(role)
         st.json(policy)
-
     except Exception as exc:
-        st.error("Unable to retrieve the extracted policy.")
-
-        with st.expander("Show policy error"):
+        st.error("Could not retrieve the extracted policy.")
+        with st.expander("Technical details"):
             st.exception(exc)
 
-    # =======================================================================
-    # Execution results
-    # =======================================================================
-
+    # Results
     st.subheader("Execution Results")
+
+    postgres_rows = result["postgres_rows"]
+    reader_rows = result["reader_rows"]
 
     postgres_col, reader_col = st.columns(2)
 
-    # -----------------------------------------------------------------------
-    # PostgreSQL
-    # -----------------------------------------------------------------------
-
     with postgres_col:
-        st.markdown("### PostgreSQL DBMS Path")
+        st.markdown("### PostgreSQL DBMS")
 
         st.caption(
-            "The query is executed through PostgreSQL and "
-            "PostgreSQL applies RLS."
+            "The SQL query is executed through PostgreSQL and "
+            "RLS is enforced by the DBMS."
         )
 
-        postgres_rows = result["postgres_rows"]
-
         if postgres_rows:
-            postgres_df = pd.DataFrame(postgres_rows)
-
             st.dataframe(
-                postgres_df,
+                pd.DataFrame(postgres_rows),
                 use_container_width=True,
                 hide_index=True,
             )
         else:
-            st.warning(
-                "PostgreSQL returned zero authorized rows."
-            )
+            st.warning("No rows returned.")
 
-        st.metric(
-            "Rows returned",
-            len(postgres_rows),
-        )
-
-    # -----------------------------------------------------------------------
-    # Direct reader
-    # -----------------------------------------------------------------------
+        st.write(f"Rows returned: **{len(postgres_rows)}**")
 
     with reader_col:
-        st.markdown("### Direct Reader Path")
+        st.markdown("### Direct Reader")
 
         st.caption(
             "The Python reader scans the frozen binary snapshot "
-            "and applies the policy locally."
+            "and applies the extracted policy locally."
         )
 
-        reader_rows = result["reader_rows"]
-
         if reader_rows:
-            reader_df = pd.DataFrame(reader_rows)
-
             st.dataframe(
-                reader_df,
+                pd.DataFrame(reader_rows),
                 use_container_width=True,
                 hide_index=True,
             )
         else:
-            st.warning(
-                "The direct reader returned zero authorized rows."
-            )
+            st.warning("No rows returned.")
 
-        st.metric(
-            "Rows returned",
-            len(reader_rows),
-        )
+        st.write(f"Rows returned: **{len(reader_rows)}**")
 
-    # =======================================================================
     # Correctness
-    # =======================================================================
-
     st.divider()
-
     st.subheader("Correctness Oracle")
 
-    st.write(
-        "PostgreSQL is treated as the baseline. "
-        "The direct-reader result is compared against it."
+    st.caption(
+        "PostgreSQL is the baseline. The direct reader must not return "
+        "forbidden rows or omit rows authorized by PostgreSQL."
     )
 
-    correctness_col1, correctness_col2, correctness_col3 = st.columns(3)
+    corr_col1, corr_col2, corr_col3 = st.columns(3)
 
-    # -----------------------------------------------------------------------
-    # Soundness
-    # -----------------------------------------------------------------------
-
-    with correctness_col1:
+    with corr_col1:
         st.metric(
             "Soundness",
             "PASS" if correctness.soundness else "FAIL",
         )
 
-        if correctness.soundness:
-            st.success("No unauthorized direct-reader rows detected.")
-        else:
-            st.error("Direct reader returned an unauthorized row.")
-
-    # -----------------------------------------------------------------------
-    # Completeness
-    # -----------------------------------------------------------------------
-
-    with correctness_col2:
+    with corr_col2:
         st.metric(
             "Completeness",
             "PASS" if correctness.completeness else "FAIL",
         )
 
-        if correctness.completeness:
-            st.success("No PostgreSQL-authorized rows were omitted.")
-        else:
-            st.error("Direct reader omitted an authorized row.")
-
-    # -----------------------------------------------------------------------
-    # Overall match
-    # -----------------------------------------------------------------------
-
-    with correctness_col3:
+    with corr_col3:
         st.metric(
             "Results Match",
             "YES" if correctness.results_match else "NO",
         )
 
-        if correctness.results_match:
-            st.success("PostgreSQL and direct-reader results match.")
-        else:
-            st.error("PostgreSQL and direct-reader results differ.")
-
-    # -----------------------------------------------------------------------
-    # Mismatch details
-    # -----------------------------------------------------------------------
-
-    if not correctness.results_match:
-        st.warning(
-            "The two execution paths produced different result sets."
+    if correctness.results_match:
+        st.success(
+            "Correctness check passed: both execution paths returned "
+            "equivalent authorized result sets."
+        )
+    else:
+        st.error(
+            "Correctness check failed: the two result sets differ."
         )
 
         mismatch_col1, mismatch_col2 = st.columns(2)
 
         with mismatch_col1:
             st.markdown("#### PostgreSQL-only rows")
-
             if correctness.postgres_only_rows:
                 st.dataframe(
                     pd.DataFrame(correctness.postgres_only_rows),
@@ -460,7 +392,6 @@ else:
 
         with mismatch_col2:
             st.markdown("#### Direct-reader-only rows")
-
             if correctness.reader_only_rows:
                 st.dataframe(
                     pd.DataFrame(correctness.reader_only_rows),
@@ -470,50 +401,41 @@ else:
             else:
                 st.write("None")
 
-    # =======================================================================
     # Performance
-    # =======================================================================
-
     st.divider()
-
     st.subheader("Performance")
 
-    performance_col1, performance_col2, performance_col3 = st.columns(3)
+    perf_col1, perf_col2, perf_col3 = st.columns(3)
 
-    performance_col1.metric(
-        "PostgreSQL Average",
-        f"{postgres_stats.average_ms:.3f} ms",
-    )
+    with perf_col1:
+        st.metric(
+            "PostgreSQL average",
+            f"{postgres_stats.average_ms:.3f} ms",
+        )
 
-    performance_col2.metric(
-        "Direct Reader Average",
-        f"{reader_stats.average_ms:.3f} ms",
-    )
+    with perf_col2:
+        st.metric(
+            "Direct Reader average",
+            f"{reader_stats.average_ms:.3f} ms",
+        )
 
-    performance_col3.metric(
-        "Speedup",
-        f"{result['speedup']:.3f}x",
-    )
-
-    # -----------------------------------------------------------------------
-    # Detailed timing table
-    # -----------------------------------------------------------------------
+    with perf_col3:
+        st.metric(
+            "Speedup",
+            f"{result['speedup']:.3f}x",
+        )
 
     timing_df = pd.DataFrame(
         [
             {
-                "Execution Path": "PostgreSQL",
-                "Average Latency (ms)": postgres_stats.average_ms,
-                "Standard Deviation (ms)": (
-                    postgres_stats.standard_deviation_ms
-                ),
+                "Path": "PostgreSQL",
+                "Average latency (ms)": postgres_stats.average_ms,
+                "Std. deviation (ms)": postgres_stats.standard_deviation_ms,
             },
             {
-                "Execution Path": "Direct Reader",
-                "Average Latency (ms)": reader_stats.average_ms,
-                "Standard Deviation (ms)": (
-                    reader_stats.standard_deviation_ms
-                ),
+                "Path": "Direct Reader",
+                "Average latency (ms)": reader_stats.average_ms,
+                "Std. deviation (ms)": reader_stats.standard_deviation_ms,
             },
         ]
     )
@@ -524,38 +446,24 @@ else:
         hide_index=True,
     )
 
-    # -----------------------------------------------------------------------
-    # Chart
-    # -----------------------------------------------------------------------
+    st.markdown("### Average latency comparison")
 
-    st.markdown("### Average Latency Comparison")
-
-    chart_df = timing_df.set_index("Execution Path")[
-        ["Average Latency (ms)"]
-    ]
-
+    chart_df = timing_df.set_index("Path")[["Average latency (ms)"]]
     st.bar_chart(chart_df)
 
-    # =======================================================================
     # Interpretation
-    # =======================================================================
-
-    st.markdown("### Interpretation")
+    st.subheader("Measured Interpretation")
 
     if result["speedup"] > 1:
         st.write(
-            f"For this measured case, the direct reader was "
-            f"{result['speedup']:.3f}x as fast as the PostgreSQL path "
-            f"according to average latency."
+            f"For this measured case, the direct reader had lower average "
+            f"latency, with a measured ratio of {result['speedup']:.3f}x."
         )
-
     elif result["speedup"] < 1:
         st.write(
-            f"For this measured case, the direct reader was slower "
-            f"than the PostgreSQL path. The measured speedup value was "
-            f"{result['speedup']:.3f}x."
+            f"For this measured case, the direct reader had higher average "
+            f"latency, with a measured ratio of {result['speedup']:.3f}x."
         )
-
     else:
         st.write(
             "For this measured case, the two execution paths had "
@@ -563,6 +471,15 @@ else:
         )
 
     st.caption(
-        "This is a measured result for the selected dataset and role; "
-        "it is not a general performance claim about PostgreSQL."
+        "This result describes the selected dataset and role only; "
+        "it is not a general performance claim."
     )
+
+    with st.expander("Current prototype scope"):
+        st.write(
+            "Read-only, single-table execution over a frozen PostgreSQL "
+            "binary COPY snapshot with the supported row-level policy grammar. "
+            "Live heap parsing, joins, writes, concurrent updates, masking, "
+            "auditing, arbitrary policy expressions, and LLM-generated heap "
+            "parsing are outside this first version."
+        )
