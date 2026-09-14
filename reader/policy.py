@@ -2,14 +2,101 @@
 
 
 class UnsupportedPolicyError(Exception):
-    """Raised when a PostgreSQL policy is outside the supported subset."""
+    """Raised when a policy is outside the supported subset."""
 
 
-def extract_policies(connection, table_name: str):
-    """TODO: read supported RLS policies from pg_policy."""
-    raise NotImplementedError
+SUPPORTED_COLUMNS = {"id", "name", "department", "salary"}
+SUPPORTED_COMPARISON_OPERATORS = {"=", "<", "<=", ">", ">="}
+SUPPORTED_LOGICAL_OPERATORS = {"AND", "OR"}
 
 
-def evaluate_policy(row: dict, policy) -> bool:
-    """TODO: evaluate a supported policy using SQL-compatible NULL semantics."""
-    raise NotImplementedError
+def evaluate_policy(row: dict, policy: dict) -> bool:
+    """Evaluate a supported policy using SQL-compatible NULL semantics."""
+
+    if not isinstance(policy, dict):
+        raise UnsupportedPolicyError("Policy must be a dictionary")
+
+    policy_type = policy.get("type")
+
+    if policy_type == "comparison":
+        return _evaluate_comparison(row, policy)
+
+    if policy_type == "logical":
+        return _evaluate_logical(row, policy)
+
+    raise UnsupportedPolicyError(
+        f"Unsupported policy type: {policy_type}"
+    )
+
+
+def _evaluate_comparison(row: dict, policy: dict) -> bool:
+    column = policy.get("column")
+    operator = policy.get("operator")
+    expected = policy.get("value")
+
+    if column not in SUPPORTED_COLUMNS:
+        raise UnsupportedPolicyError(
+            f"Unsupported policy column: {column}"
+        )
+
+    if operator not in SUPPORTED_COMPARISON_OPERATORS:
+        raise UnsupportedPolicyError(
+            f"Unsupported comparison operator: {operator}"
+        )
+
+    if column not in row:
+        raise UnsupportedPolicyError(
+            f"Column {column} is missing from row"
+        )
+
+    actual = row[column]
+
+    # SQL comparisons involving NULL produce UNKNOWN.
+    # UNKNOWN is not selected by a WHERE condition.
+    if actual is None or expected is None:
+        return False
+
+    if operator == "=":
+        return actual == expected
+
+    if operator == "<":
+        return actual < expected
+
+    if operator == "<=":
+        return actual <= expected
+
+    if operator == ">":
+        return actual > expected
+
+    if operator == ">=":
+        return actual >= expected
+
+    raise UnsupportedPolicyError(
+        f"Unsupported comparison operator: {operator}"
+    )
+
+
+def _evaluate_logical(row: dict, policy: dict) -> bool:
+    operator = policy.get("operator")
+    left = policy.get("left")
+    right = policy.get("right")
+
+    if operator not in SUPPORTED_LOGICAL_OPERATORS:
+        raise UnsupportedPolicyError(
+            f"Unsupported logical operator: {operator}"
+        )
+
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        raise UnsupportedPolicyError(
+            "Logical policy requires left and right policies"
+        )
+
+    if operator == "AND":
+        return evaluate_policy(row, left) and evaluate_policy(row, right)
+
+    if operator == "OR":
+        return evaluate_policy(row, left) or evaluate_policy(row, right)
+
+    raise UnsupportedPolicyError(
+        f"Unsupported logical operator: {operator}"
+    )
