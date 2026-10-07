@@ -468,12 +468,6 @@ def run_suite(sizes=(1000, 10000, 100000), thresholds=(0, 70000, 100000), null_p
     (PROJECT_ROOT / 'results' / 'benchmark_samples.json').write_text(
         json.dumps(dict(measured_at_utc=datetime.now(timezone.utc).isoformat(), cases=samples), indent=2),
         encoding='utf-8')
-    evidence_dir = PROJECT_ROOT / 'docs' / 'evidence'
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    for name in ['benchmark_results.csv', 'benchmark_samples.json']:
-        shutil.copyfile(PROJECT_ROOT / 'results' / name, evidence_dir / name)
-    from submission import write_report
-    write_report()
     return records
 
 

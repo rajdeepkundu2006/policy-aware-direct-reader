@@ -1,4 +1,4 @@
-"""One entry point for setup, UI, tests, and submission experiments."""
+"""One entry point for setup, UI, tests, and benchmarks."""
 import argparse
 from pathlib import Path
 import subprocess
@@ -25,12 +25,10 @@ def setup():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', nargs='?', default='app', choices=['app','setup','test','benchmark','suite','data','demo'])
+    parser.add_argument('command', nargs='?', default='app', choices=['app','setup','test','benchmark','suite','data'])
     parser.add_argument('--rows', type=int, default=10000)
     parser.add_argument('--null-percent', type=int, default=5)
     args = parser.parse_args()
-    if args.command == 'demo':
-        raise SystemExit(subprocess.call([sys.executable, '-m', 'streamlit', 'run', str(PROJECT_ROOT / 'app' / 'demo.py')], cwd=PROJECT_ROOT))
     if args.command == 'test':
         raise SystemExit(subprocess.call([sys.executable, '-m', 'pytest', '-q', '--basetemp', str(PROJECT_ROOT / '.test-tmp')], cwd=PROJECT_ROOT))
     if args.command in {'setup', 'data'}:
@@ -60,7 +58,7 @@ def main():
         smoke()
     else:
         records = run_suite(progress=lambda n, total: print(f'Experiment {n}/{total}', flush=True))
-        print(f"Saved {len(records)} cases and docs/SUBMISSION_REPORT.md")
+        print(f"Saved {len(records)} cases to results/benchmark_results.csv")
 
 
 if __name__ == '__main__':

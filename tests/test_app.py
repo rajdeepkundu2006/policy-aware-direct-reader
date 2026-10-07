@@ -1,4 +1,4 @@
-"""Exercise the teacher-facing comparison flow without changing demo data."""
+"""Exercise the comparison flow without changing demo data."""
 import os
 from config import PROJECT_ROOT
 import pytest
@@ -10,7 +10,7 @@ pytestmark = pytest.mark.skipif(not os.getenv('PGPASSWORD') or os.getenv('PGPASS
 def test_guided_ui_and_encoding():
     app = AppTest.from_file(PROJECT_ROOT / 'app' / 'app.py').run(timeout=30)
     assert not app.exception and not app.error
-    assert [tab.label for tab in app.tabs] == ['1. Compare results','2. Change dataset','3. Batch benchmarks']
+    assert [tab.label for tab in app.tabs] == ['Comparison','Dataset','Benchmarks']
     assert any('&#8595;' in element.value for element in app.markdown)
     assert any(metric.label == 'Synthetic rows' for metric in app.metric)
     assert not any(button.label == 'Create / Refresh Snapshot' for button in app.button)

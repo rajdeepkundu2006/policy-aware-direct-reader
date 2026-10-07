@@ -1,5 +1,0 @@
-Command: python -m pytest -q
-Captured locally on 7 October 2026
-
-...............................................                          [100%]
-47 passed in 10.98s

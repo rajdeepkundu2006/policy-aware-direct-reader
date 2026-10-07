@@ -1,4 +1,4 @@
-"""A guided demonstration of PostgreSQL RLS and the direct snapshot reader."""
+"""Compare PostgreSQL RLS with the direct snapshot reader."""
 from __future__ import annotations
 import json
 from pathlib import Path
@@ -22,8 +22,7 @@ st.markdown('''<style>
 .result-description {min-height:48px;color:#a4a8af;font-size:.9rem;line-height:1.5;margin:0 0 12px;}
 </style>''', unsafe_allow_html=True)
 st.title('Policy-Aware Direct Snapshot Reader')
-st.caption('DBMS semester project | PostgreSQL RLS compared with a Python binary snapshot reader')
-st.caption('Evaluator without PostgreSQL? Run run.cmd demo for the local reader replay, or open demo/index.html for saved evidence.')
+st.caption('PostgreSQL row-level security and local binary snapshot filtering')
 
 
 def database_summary():
@@ -46,10 +45,10 @@ except Exception as exc:
 if 'notice' in st.session_state:
     st.success(st.session_state.pop('notice'))
 
-st.sidebar.header('Compare one role')
+st.sidebar.header('Access control')
 role = st.sidebar.selectbox('Role', SUPPORTED_ROLES,
                            format_func=lambda value: {'it_user':'IT', 'hr_user':'HR', 'finance_user':'Finance'}[value])
-st.sidebar.caption('This chooses whose rows are visible. It does not change the database dataset.')
+st.sidebar.caption('Visibility is determined by the selected database role.')
 with st.sidebar.expander('Timing settings'):
     warmup_runs = st.number_input('Warm-up runs', min_value=0, max_value=20, value=3,
                                   help='Untimed repetitions to warm caches before measuring.')
@@ -57,18 +56,17 @@ with st.sidebar.expander('Timing settings'):
                                     help='Timed repetitions used for the average and standard deviation.')
 st.sidebar.divider()
 st.sidebar.metric('Current PostgreSQL rows', f"{summary['total']:,}")
-st.sidebar.caption('Every comparison automatically exports fresh PostgreSQL data. No manual snapshot refresh is needed.')
+st.sidebar.caption('Snapshot refreshed automatically for each comparison.')
 
-compare_tab, dataset_tab, batch_tab = st.tabs(['1. Compare results', '2. Change dataset', '3. Batch benchmarks'])
+compare_tab, dataset_tab, batch_tab = st.tabs(['Comparison', 'Dataset', 'Benchmarks'])
 
 with compare_tab:
     st.subheader('Compare the current dataset')
-    st.write('Choose a role on the left, then run the comparison. To change how many rows are in PostgreSQL, use the Change dataset tab.')
     counts = st.columns(3)
     counts[0].metric('Rows in PostgreSQL', f"{summary['total']:,}")
     counts[1].metric('Original demo rows', f"{summary['original']:,}")
     counts[2].metric('Synthetic rows', f"{summary['generated']:,}")
-    st.caption('The generated employees are stored in PostgreSQL first. The binary snapshot is exported from those same database rows.')
+    st.caption('Source: PostgreSQL employees table. Snapshot format: binary COPY.')
     with st.expander('How the two paths work'):
         for column, title, steps in zip(st.columns(2), ['PostgreSQL DBMS path', 'Direct reader path'],
                                        [['SQL query', 'PostgreSQL engine', 'RLS enforcement', 'Authorized result'],
@@ -93,7 +91,7 @@ with compare_tab:
     if result is not None and result['role'] != role:
         result = None
     if result is None:
-        st.info('Ready: run a comparison to see both result tables, correctness and latency.')
+        st.info('No comparison results.')
     else:
         st.divider()
         st.subheader('Authorized employee rows')
@@ -123,7 +121,7 @@ with compare_tab:
         if correctness.results_match:
             st.success('Both paths returned the same authorized rows and field values.')
         else:
-            st.error('The results differ. Treat these performance numbers as an invalid correctness case.')
+            st.error('Result mismatch. Performance comparison is not valid for this case.')
             with st.expander('Rows that differ'):
                 st.write('PostgreSQL-only rows', correctness.postgres_only_rows)
                 st.write('Reader-only rows', correctness.reader_only_rows)
@@ -148,19 +146,18 @@ with compare_tab:
         frame = pd.DataFrame([{'Path':'PostgreSQL', 'Average ms':pg.average_ms, 'Standard deviation ms':pg.standard_deviation_ms},
                               {'Path':'Direct reader', 'Average ms':reader.average_ms, 'Standard deviation ms':reader.standard_deviation_ms}])
         st.bar_chart(frame.set_index('Path')[['Average ms']])
-        st.caption('Lower latency is better. A small dataset can favor Python; larger scans can favor PostgreSQL. This is a measured result, not a guaranteed speedup.')
+        st.caption('Latency ratio = PostgreSQL / reader. Values above 1 favor the reader; below 1 favor PostgreSQL.')
         with st.expander('Timing samples and CSV export'):
             st.dataframe(frame, hide_index=True)
-            st.write('This CSV contains one summary row for this role and dataset: timings, row counts, policy and correctness. It does not export the employee table.')
+            st.caption('CSV fields: timing statistics, row counts, policy and correctness.')
             record = dict(result_record(result), policy_ast=json.dumps(result['policy']),
                           null_department_rows=result['null_department_rows'], null_salary_rows=result['null_salary_rows'])
             st.download_button('Download comparison summary (CSV)', pd.DataFrame([record]).to_csv(index=False), 'comparison_summary.csv', 'text/csv')
 
 with dataset_tab:
-    st.subheader('Change the data used in the demonstration')
+    st.subheader('Dataset configuration')
     st.write(f"PostgreSQL currently contains **{summary['total']:,} employees**: **{summary['original']:,} original** and **{summary['generated']:,} synthetic** rows.")
-    st.write('Use this only when you want a different dataset size or access rule. Applying it writes synthetic employees into PostgreSQL, '
-             'updates the three demo policies, and exports employees.bin. Then return to Compare results.')
+    st.caption('Dataset changes update PostgreSQL rows, access policies and the binary snapshot.')
     st.caption(f"Current NULL values: {summary['null_department']:,} departments and {summary['null_salary']:,} salaries. "
                'Rows with NULL policy attributes may be denied by SQL comparisons.')
     sizes = [10, 1000, 10000, 100000, 1000000]
@@ -171,8 +168,7 @@ with dataset_tab:
         threshold = st.selectbox('Access rule for every role', [0, 70000, 100000],
                                  format_func=lambda n: 'Own department only' if n == 0 else f'Own department and salary at least {n:,}')
         apply_dataset = st.form_submit_button('Apply dataset and access rule')
-    st.caption('Original rows are preserved. Only synthetic rows previously created by this generator are replaced. '
-               'This changes the data; it does not run a timed comparison.')
+    st.caption('Original rows are preserved; generated rows are replaced.')
     if apply_dataset:
         try:
             with st.spinner('Writing synthetic employees into PostgreSQL and exporting the snapshot...'):
@@ -181,24 +177,23 @@ with dataset_tab:
                     set_demo_threshold(connection, threshold)
                 export_binary_snapshot()
             st.session_state.pop('benchmark_result', None)
-            st.session_state['notice'] = f'Dataset updated: {count:,} employees. Open Compare results and click Run comparison.'
+            st.session_state['notice'] = f'Dataset updated: {count:,} employees.'
             st.rerun()
         except Exception as exc:
             st.error(f'Dataset update failed: {exc}')
 
 with batch_tab:
-    st.subheader('Run the 27-case research benchmark')
-    st.write('This optional batch is for your submission report. It automatically tests all three roles, '
-             '1,000 / 10,000 / 100,000 rows, and three salary rules. You do not need to change the dataset manually first.')
-    st.info('Batch changes are temporary. Your current demonstration data and policies are restored afterward.')
-    st.caption('Uses 2 warm-ups and 5 timed runs per path for each case. The sidebar timing settings apply only to single comparisons.')
+    st.subheader('Benchmark matrix')
+    st.caption('27 cases: three roles, three dataset sizes (1,000 / 10,000 / 100,000), and three salary thresholds.')
+    st.info('Dataset and policy changes are rolled back after the benchmark.')
+    st.caption('Each case uses 2 warm-ups and 5 measured repetitions per path.')
     if st.button('Run all 27 benchmark cases', key='run_batch'):
         st.session_state.pop('suite_records', None)
         try:
             progress = st.progress(0)
             with st.spinner('Measuring 27 cases; this may take a minute...'):
                 st.session_state['suite_records'] = run_suite(progress=lambda n,total: progress.progress(n/total))
-            st.success('Saved the CSV, raw timing samples and submission report. Your demonstration dataset is unchanged.')
+            st.success('Benchmark complete. CSV and raw timing samples saved.')
         except Exception as exc:
             st.error(f'Batch benchmark failed: {exc}')
     records = st.session_state.get('suite_records')
@@ -206,7 +201,7 @@ with batch_tab:
         saved = PROJECT_ROOT / 'results' / 'benchmark_results.csv'
         if saved.exists():
             records = pd.read_csv(saved).to_dict('records')
-            st.caption('Showing previously saved batch results. Run the batch again to replace them.')
+            st.caption('Saved benchmark results.')
     if records:
         frame = pd.DataFrame(records)
         st.dataframe(frame, hide_index=True)
@@ -214,4 +209,4 @@ with batch_tab:
         st.line_chart(frame[frame.minimum_salary == 0].pivot(index='dataset_size', columns='role', values='speedup'))
         st.caption('Ratio above 1 favors the reader; below 1 favors PostgreSQL.')
 
-st.caption('Scope: trusted local demo; one table, read-only queries, frozen binary COPY snapshots and a restricted policy grammar. No live heap-page parsing.')
+st.caption('Table: employees | Format: PostgreSQL binary COPY | Queries: read-only')
