@@ -1,12 +1,13 @@
 """Direct snapshot reader."""
 
 from reader.parser import iter_binary_rows
-from reader.policy import evaluate_policy
+from reader.policy import evaluate_policy, validate_policy
 
 
 def read_snapshot(snapshot_path: str, policy: dict) -> list[dict]:
     """Read a frozen PostgreSQL binary snapshot and apply a policy."""
 
+    validate_policy(policy)
     results = []
 
     for row in iter_binary_rows(snapshot_path):

@@ -10,6 +10,31 @@ SUPPORTED_COMPARISON_OPERATORS = {"=", "<", "<=", ">", ">="}
 SUPPORTED_LOGICAL_OPERATORS = {"AND", "OR"}
 
 
+def validate_policy(policy):
+    """Validate every branch before any rows are released."""
+    if not isinstance(policy, dict):
+        raise UnsupportedPolicyError('Policy must be a dictionary')
+    kind = policy.get('type')
+    if kind == 'constant' and type(policy.get('value')) is bool:
+        return
+    if kind == 'comparison':
+        column = policy.get('column')
+        value = policy.get('value')
+        if column not in SUPPORTED_COLUMNS or policy.get('operator') not in SUPPORTED_COMPARISON_OPERATORS:
+            raise UnsupportedPolicyError('Unsupported comparison')
+        if column in {'name', 'department'} and policy['operator'] != '=':
+            raise UnsupportedPolicyError('Text ranges require collation support')
+        expected_type = int if column in {'id', 'salary'} else str
+        if value is not None and type(value) is not expected_type:
+            raise UnsupportedPolicyError('Policy literal does not match column type')
+        return
+    if kind == 'logical' and policy.get('operator') in SUPPORTED_LOGICAL_OPERATORS:
+        validate_policy(policy.get('left'))
+        validate_policy(policy.get('right'))
+        return
+    raise UnsupportedPolicyError('Unsupported policy structure')
+
+
 def evaluate_policy(row: dict, policy: dict) -> bool:
     """Evaluate a supported policy using SQL-compatible NULL semantics."""
 
@@ -17,6 +42,9 @@ def evaluate_policy(row: dict, policy: dict) -> bool:
         raise UnsupportedPolicyError("Policy must be a dictionary")
 
     policy_type = policy.get("type")
+
+    if policy_type == 'constant':
+        return policy['value']
 
     if policy_type == "comparison":
         return _evaluate_comparison(row, policy)

@@ -35,6 +35,8 @@ def iter_binary_rows(snapshot_path: str):
                 field_count = struct.unpack("!h", _read_exact(f, 2))[0]
 
                 if field_count == -1:
+                    if f.read(1):
+                        raise ValueError('Unexpected data after COPY trailer')
                     break
 
                 if field_count != 4:
@@ -48,6 +50,8 @@ def iter_binary_rows(snapshot_path: str):
                     if length == -1:
                         value = None
                     else:
+                        if length < 0:
+                            raise ValueError('Invalid negative field length')
                         data = _read_exact(f, length)
 
                         if column == "id" or column == "salary":

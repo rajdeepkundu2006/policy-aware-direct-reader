@@ -7,8 +7,8 @@
 CREATE TABLE IF NOT EXISTS employees (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
-    department TEXT NOT NULL,
-    salary INTEGER NOT NULL
+    department TEXT,
+    salary INTEGER
 );
 
 -- =========================================================
@@ -68,3 +68,7 @@ ON CONFLICT (id) DO NOTHING;
 GRANT SELECT ON employees TO it_user;
 GRANT SELECT ON employees TO hr_user;
 GRANT SELECT ON employees TO finance_user;
+
+-- Existing installations also need nullable policy attributes for experiments.
+ALTER TABLE employees ALTER COLUMN department DROP NOT NULL;
+ALTER TABLE employees ALTER COLUMN salary DROP NOT NULL;

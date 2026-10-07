@@ -18,12 +18,12 @@ The module:
 
 from __future__ import annotations
 
-import os
 import statistics
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, cast
 
 import psycopg
 from psycopg import sql
@@ -31,7 +31,15 @@ from psycopg import sql
 from database.policy_ast import extract_policies_from_database
 from reader.snapshot_reader import read_snapshot
 
-from typing import Any, Callable, Iterable, cast
+from config import connection_settings
+from database.policy_ast import extract_policies_from_connection
+from reader.parser import iter_binary_rows
+from collections import Counter
+import csv
+import tempfile
+import json
+from datetime import datetime, timezone
+from contextlib import nullcontext
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +53,7 @@ SUPPORTED_ROLES = (
 
 DEFAULT_QUERY = """
 SELECT id, name, department, salary
-FROM employees
+FROM public.employees
 ORDER BY id;
 """.strip()
 
@@ -68,20 +76,7 @@ class BenchmarkStats:
 
 def _get_connection_kwargs() -> dict[str, Any]:
     """Read PostgreSQL connection settings from environment variables."""
-    password = os.getenv("PGPASSWORD")
-    if not password:
-        raise RuntimeError(
-            "PGPASSWORD is not set. Set it in the current terminal "
-            "before running the project."
-        )
-
-    return {
-        "host": os.getenv("PGHOST", "localhost"),
-        "port": int(os.getenv("PGPORT", "5432")),
-        "dbname": os.getenv("PGDATABASE", "direct_reader_db"),
-        "user": os.getenv("PGUSER", "postgres"),
-        "password": password,
-    }
+    return connection_settings()
 
 
 def get_connection() -> psycopg.Connection:
@@ -153,12 +148,6 @@ def normalize_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return normalized
 
 
-def _rows_by_id(
-    rows: Iterable[dict[str, Any]],
-) -> dict[Any, dict[str, Any]]:
-    return {row["id"]: row for row in rows}
-
-
 def compare_results(
     postgres_rows: Iterable[dict[str, Any]],
     reader_rows: Iterable[dict[str, Any]],
@@ -177,17 +166,11 @@ def compare_results(
     postgres = normalize_rows(postgres_rows)
     reader = normalize_rows(reader_rows)
 
-    postgres_map = _rows_by_id(postgres)
-    reader_map = _rows_by_id(reader)
-
-    postgres_only = [
-        postgres_map[row_id]
-        for row_id in sorted(set(postgres_map) - set(reader_map))
-    ]
-    reader_only = [
-        reader_map[row_id]
-        for row_id in sorted(set(reader_map) - set(postgres_map))
-    ]
+    columns = ('id', 'name', 'department', 'salary')
+    postgres_counts = Counter(tuple(row[c] for c in columns) for row in postgres)
+    reader_counts = Counter(tuple(row[c] for c in columns) for row in reader)
+    postgres_only = [dict(zip(columns, row)) for row, count in (postgres_counts - reader_counts).items() for _ in range(count)]
+    reader_only = [dict(zip(columns, row)) for row, count in (reader_counts - postgres_counts).items() for _ in range(count)]
 
     soundness = len(reader_only) == 0
     completeness = len(postgres_only) == 0
@@ -243,21 +226,28 @@ def export_binary_snapshot(
     snapshot_path = Path(snapshot_path)
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
 
-    copy_command = """
-        COPY employees TO STDOUT WITH (FORMAT binary)
-    """
-
     with get_connection() as connection:
-        with connection.cursor() as cursor:
-            with cursor.copy(copy_command) as copy:
-                with snapshot_path.open("wb") as output_file:
-                    while True:
-                        chunk = copy.read()
-                        if not chunk:
-                            break
-                        output_file.write(chunk)
-
+        _export_from_connection(connection, snapshot_path)
     return snapshot_path
+
+
+def _export_from_connection(connection, snapshot_path):
+    """Atomically publish an ordered export; never leave a half-written snapshot."""
+    snapshot_path = Path(snapshot_path)
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=snapshot_path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            with connection.cursor() as cursor:
+                with cursor.copy('COPY (SELECT id, name, department, salary FROM public.employees ORDER BY id) TO STDOUT WITH (FORMAT binary)') as copy:
+                    while chunk := copy.read():
+                        output.write(chunk)
+        temporary.replace(snapshot_path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
 
 
 def run_direct_reader(
@@ -328,6 +318,7 @@ def benchmark_role(
     snapshot_path: str | Path = DEFAULT_SNAPSHOT_PATH,
     warmup_runs: int = 3,
     measured_runs: int = 10,
+    connection=None,
 ) -> dict[str, Any]:
     """
     Run one complete benchmark case for a role.
@@ -337,38 +328,56 @@ def benchmark_role(
     """
     _validate_role(role)
     snapshot_path = Path(snapshot_path)
+    (PROJECT_ROOT / 'data').mkdir(exist_ok=True)
 
-    if not snapshot_path.exists():
-        export_binary_snapshot(snapshot_path)
-
-    policy = get_policy_for_role(role)
-
-    with get_connection() as connection:
+    # The same transaction supplies data, policy definitions, and baseline.
+    # SHARE lock blocks writes/policy DDL while repeatable read fixes visibility.
+    supplied_connection = connection is not None
+    with (nullcontext(connection) if supplied_connection else get_connection()) as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
-                sql.SQL("SET ROLE {}").format(sql.Identifier(role))
+            if not supplied_connection:
+                cursor.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+            cursor.execute("SET LOCAL lock_timeout = '10s'")
+            cursor.execute('LOCK TABLE public.employees IN SHARE MODE')
+        policy_start = time.perf_counter()
+        policy = extract_policies_from_connection(connection)[role]
+        policy_resolution_ms = (time.perf_counter() - policy_start) * 1000
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT count(*) FILTER (WHERE department IS NULL), count(*) FILTER (WHERE salary IS NULL) FROM public.employees')
+            null_department_rows, null_salary_rows = cursor.fetchone()
+        # Private files avoid cross-session refresh races during an experiment.
+        with tempfile.TemporaryDirectory(prefix='reader-experiment-', dir=PROJECT_ROOT / 'data') as directory:
+            experiment_snapshot = Path(directory) / 'employees.bin'
+            _export_from_connection(connection, experiment_snapshot)
+            rows_scanned = sum(1 for _ in iter_binary_rows(str(experiment_snapshot)))
+            # Keep the public snapshot only as a demonstration artifact.
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(experiment_snapshot, snapshot_path)
+            with connection.cursor() as cursor:
+                cursor.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+            postgres_rows = _execute_postgres_query(connection, DEFAULT_QUERY)
+
+            reader_rows = read_snapshot(
+                str(experiment_snapshot),
+                policy,
             )
 
-        postgres_rows = _execute_postgres_query(connection, DEFAULT_QUERY)
+            correctness = compare_results(postgres_rows, reader_rows)
 
-        reader_rows = read_snapshot(
-            str(snapshot_path),
-            policy,
-        )
+            postgres_stats = benchmark_callable(
+                lambda: _execute_postgres_query(connection, DEFAULT_QUERY),
+                warmup_runs=warmup_runs,
+                measured_runs=measured_runs,
+            )
 
-        correctness = compare_results(postgres_rows, reader_rows)
+            reader_stats = benchmark_callable(
+                lambda: read_snapshot(str(experiment_snapshot), policy),
+                warmup_runs=warmup_runs,
+                measured_runs=measured_runs,
+            )
 
-        postgres_stats = benchmark_callable(
-            lambda: _execute_postgres_query(connection, DEFAULT_QUERY),
-            warmup_runs=warmup_runs,
-            measured_runs=measured_runs,
-        )
-
-        reader_stats = benchmark_callable(
-            lambda: read_snapshot(str(snapshot_path), policy),
-            warmup_runs=warmup_runs,
-            measured_runs=measured_runs,
-        )
+        with connection.cursor() as cursor:
+            cursor.execute('RESET ROLE')
 
     speedup = calculate_speedup(
         postgres_stats.average_ms,
@@ -377,6 +386,14 @@ def benchmark_role(
 
     return {
         "role": role,
+        "policy": policy,
+        "warmup_runs": warmup_runs,
+        "policy_resolution_ms": policy_resolution_ms,
+        "rows_scanned": rows_scanned,
+        "null_department_rows": null_department_rows,
+        "null_salary_rows": null_salary_rows,
+        "rows_returned": len(reader_rows),
+        "rows_denied": rows_scanned - len(reader_rows),
         "postgres_rows": postgres_rows,
         "reader_rows": reader_rows,
         "correctness": correctness,
@@ -386,50 +403,86 @@ def benchmark_role(
     }
 
 
-def main() -> None:
-    """Small command-line smoke test."""
-    role = "it_user"
-
-    print("=" * 70)
-    print("POLICY-AWARE DIRECT READER - INTEGRATED SMOKE TEST")
-    print("=" * 70)
-
-    snapshot = export_binary_snapshot()
-    print(f"Snapshot: {snapshot}")
-
-    result = benchmark_role(
-        role,
-        warmup_runs=1,
-        measured_runs=3,
-    )
-
-    correctness: CorrectnessResult = result["correctness"]
-    postgres_stats: BenchmarkStats = result["postgres_stats"]
-    reader_stats: BenchmarkStats = result["reader_stats"]
-
-    print(f"Role: {role}")
-    print()
-    print("PostgreSQL result:")
-    for row in result["postgres_rows"]:
-        print(row)
-
-    print()
-    print("Direct reader result:")
-    for row in result["reader_rows"]:
-        print(row)
-
-    print()
-    print(f"Soundness:       {'PASS' if correctness.soundness else 'FAIL'}")
-    print(f"Completeness:    {'PASS' if correctness.completeness else 'FAIL'}")
-    print(f"Results match:   {'YES' if correctness.results_match else 'NO'}")
-
-    print()
-    print(f"PostgreSQL avg:  {postgres_stats.average_ms:.3f} ms")
-    print(f"PostgreSQL std:  {postgres_stats.standard_deviation_ms:.3f} ms")
-    print(f"Reader avg:      {reader_stats.average_ms:.3f} ms")
-    print(f"Reader std:      {reader_stats.standard_deviation_ms:.3f} ms")
-    print(f"Speedup:         {result['speedup']:.3f}x")
+CSV_COLUMNS = ['dataset_size', 'role', 'minimum_salary', 'null_percent', 'visible_rows',
+               'selectivity', 'postgres_avg_ms', 'postgres_stddev_ms', 'reader_avg_ms',
+               'reader_stddev_ms', 'speedup', 'policy_resolution_ms', 'warmup_runs',
+               'measured_runs', 'soundness', 'completeness', 'results_match']
 
 
-if __name__ == "__main__":
+def result_record(result, minimum_salary=None, null_percent=None):
+    pg, reader, correctness = result['postgres_stats'], result['reader_stats'], result['correctness']
+    return dict(dataset_size=result['rows_scanned'], role=result['role'],
+                minimum_salary=minimum_salary, null_percent=null_percent,
+                visible_rows=result['rows_returned'],
+                selectivity=result['rows_returned'] / max(1, result['rows_scanned']),
+                postgres_avg_ms=pg.average_ms, postgres_stddev_ms=pg.standard_deviation_ms,
+                reader_avg_ms=reader.average_ms, reader_stddev_ms=reader.standard_deviation_ms,
+                speedup=result['speedup'], policy_resolution_ms=result['policy_resolution_ms'],
+                warmup_runs=result.get('warmup_runs', 3), measured_runs=len(pg.samples_ms),
+                soundness=correctness.soundness, completeness=correctness.completeness,
+                results_match=correctness.results_match)
+
+
+def save_records(records, path=None):
+    path = Path(path or PROJECT_ROOT / 'results' / 'benchmark_results.csv')
+    path.parent.mkdir(exist_ok=True, parents=True)
+    with path.open('w', newline='', encoding='utf-8') as output:
+        writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(records)
+    return path
+
+
+def run_suite(sizes=(1000, 10000, 100000), thresholds=(0, 70000, 100000), null_percent=5,
+              warmup_runs=2, measured_runs=5, progress=None):
+    """Run controlled scenarios, then roll back all data and policy changes."""
+    from database.datasets import generate_dataset, set_demo_threshold
+    records = []
+    samples = []
+    with get_connection() as connection:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+                cursor.execute("SET LOCAL lock_timeout = '10s'")
+                cursor.execute('LOCK TABLE public.employees IN ACCESS EXCLUSIVE MODE')
+            for size in sizes:
+                generate_dataset(connection, size, null_percent)
+                for threshold in thresholds:
+                    set_demo_threshold(connection, threshold)
+                    for role in SUPPORTED_ROLES:
+                        result = benchmark_role(role, connection=connection,
+                                                warmup_runs=warmup_runs, measured_runs=measured_runs)
+                        records.append(result_record(result, threshold, null_percent))
+                        samples.append(dict(records[-1], postgres_samples_ms=result['postgres_stats'].samples_ms,
+                                            reader_samples_ms=result['reader_stats'].samples_ms,
+                                            policy=result['policy']))
+                        if progress:
+                            progress(len(records), len(sizes) * len(thresholds) * len(SUPPORTED_ROLES))
+                        if not result['correctness'].results_match:
+                            raise RuntimeError('Correctness failed; benchmark suite stopped.')
+        finally:
+            connection.rollback()
+    # Restore the demonstration artifact after rolling back suite data.
+    export_binary_snapshot()
+    save_records(records)
+    (PROJECT_ROOT / 'results' / 'benchmark_samples.json').write_text(
+        json.dumps(dict(measured_at_utc=datetime.now(timezone.utc).isoformat(), cases=samples), indent=2),
+        encoding='utf-8')
+    evidence_dir = PROJECT_ROOT / 'docs' / 'evidence'
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    for name in ['benchmark_results.csv', 'benchmark_samples.json']:
+        shutil.copyfile(PROJECT_ROOT / 'results' / name, evidence_dir / name)
+    from submission import write_report
+    write_report()
+    return records
+
+
+def main():
+    for role in SUPPORTED_ROLES:
+        result = benchmark_role(role, warmup_runs=1, measured_runs=3)
+        print(role, 'match:', result['correctness'].results_match,
+              'visible:', result['rows_returned'], 'speedup:', round(result['speedup'], 3))
+
+
+if __name__ == '__main__':
     main()

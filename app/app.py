@@ -1,485 +1,217 @@
+"""A guided demonstration of PostgreSQL RLS and the direct snapshot reader."""
 from __future__ import annotations
-
+import json
 from pathlib import Path
 import sys
 
-import pandas as pd
-import streamlit as st
-
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from benchmark.benchmark import (  # noqa: E402
-    DEFAULT_QUERY,
-    DEFAULT_SNAPSHOT_PATH,
-    SUPPORTED_ROLES,
-    BenchmarkStats,
-    CorrectnessResult,
-    benchmark_role,
-    export_binary_snapshot,
-    get_policy_for_role,
-)
-
-
-st.set_page_config(
-    page_title="Policy-Aware Direct Snapshot Reader",
-    page_icon="DB",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-
-st.markdown(
-    """
-    <style>
-    .hero-title {
-        font-size: 2.25rem;
-        font-weight: 700;
-        margin-bottom: 0.2rem;
-    }
-
-    .hero-subtitle {
-        font-size: 1rem;
-        opacity: 0.78;
-        margin-bottom: 1rem;
-    }
-
-    .path-card {
-        border: 1px solid rgba(128,128,128,0.22);
-        border-radius: 12px;
-        padding: 1rem 1.1rem;
-        min-height: 135px;
-        background: rgba(128,128,128,0.035);
-    }
-
-    .path-title {
-        font-size: 1.15rem;
-        font-weight: 650;
-        margin-bottom: 0.45rem;
-    }
-
-    .path-flow {
-        font-family: monospace;
-        font-size: 0.88rem;
-        line-height: 1.55;
-        white-space: pre-line;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-st.markdown(
-    """
-    <div>
-        <div class="hero-title">Policy-Aware Direct Snapshot Reader</div>
-        <div class="hero-subtitle">
-            PostgreSQL DBMS path vs. direct snapshot reader
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.info(
-    "Research prototype: a read-only direct reader operates on a frozen "
-    "PostgreSQL binary snapshot while applying the database's supported "
-    "row-level security policy."
-)
-
-
-# Sidebar
-st.sidebar.header("Experiment")
-
-role = st.sidebar.selectbox(
-    "User role",
-    SUPPORTED_ROLES,
-    format_func=lambda value: value.replace("_", " ").title(),
-)
-
-warmup_runs = st.sidebar.number_input(
-    "Warm-up runs",
-    min_value=0,
-    max_value=20,
-    value=3,
-    step=1,
-)
-
-measured_runs = st.sidebar.number_input(
-    "Measured runs",
-    min_value=1,
-    max_value=50,
-    value=10,
-    step=1,
-)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Snapshot")
-
-if DEFAULT_SNAPSHOT_PATH.exists():
-    st.sidebar.success("employees.bin is available")
-else:
-    st.sidebar.warning("employees.bin has not been created")
-
-
-# Architecture
-st.subheader("How the two paths differ")
-
-path_col1, path_col2 = st.columns(2)
-
-with path_col1:
-    st.markdown(
-        """
-        <div class="path-card">
-            <div class="path-title">PostgreSQL DBMS Path</div>
-            <div class="path-flow">
-            SQL query
-                ↓
-            PostgreSQL engine
-                ↓
-            RLS enforcement
-                ↓
-            Authorized result
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with path_col2:
-    st.markdown(
-        """
-        <div class="path-card">
-            <div class="path-title">Direct Reader Path</div>
-            <div class="path-flow">
-            employees.bin
-                ↓
-            Binary parser
-                ↓
-            Policy evaluator
-                ↓
-            Authorized result
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# Query
-st.subheader("Read Request")
-
-st.code(DEFAULT_QUERY, language="sql")
-
-query_col1, query_col2 = st.columns(2)
-
-with query_col1:
-    st.write(f"**Role:** `{role}`")
-
-with query_col2:
-    st.write("**Table:** `employees`")
-
-
-# Actions
-action_col1, action_col2 = st.columns(2)
-
-with action_col1:
-    refresh_clicked = st.button(
-        "Create / Refresh Snapshot",
-        use_container_width=True,
-    )
-
-with action_col2:
-    run_clicked = st.button(
-        "Run Full Comparison",
-        type="primary",
-        use_container_width=True,
-    )
-
-
-if refresh_clicked:
-    try:
-        with st.spinner("Exporting PostgreSQL binary snapshot..."):
-            snapshot = export_binary_snapshot(DEFAULT_SNAPSHOT_PATH)
-
-        st.success(f"Snapshot ready: {snapshot}")
-
-    except Exception as exc:
-        st.error("Snapshot export failed.")
-        with st.expander("Technical details"):
-            st.exception(exc)
-
-
-if run_clicked:
-    try:
-        if not DEFAULT_SNAPSHOT_PATH.exists():
-            with st.spinner("Creating binary snapshot..."):
-                export_binary_snapshot(DEFAULT_SNAPSHOT_PATH)
-
-        with st.spinner(
-            "Running PostgreSQL baseline, direct reader, "
-            "correctness checks, and timing..."
-        ):
-            result = benchmark_role(
-                role,
-                snapshot_path=DEFAULT_SNAPSHOT_PATH,
-                warmup_runs=int(warmup_runs),
-                measured_runs=int(measured_runs),
-            )
-
-        st.session_state["benchmark_result"] = result
-        st.session_state["benchmark_role"] = role
-
-        st.success("Experiment completed successfully.")
-
-    except Exception as exc:
-        st.error("The experiment could not be completed.")
-        with st.expander("Technical details"):
-            st.exception(exc)
-
-
-result = st.session_state.get("benchmark_result")
-
-
-if result is None:
-    st.divider()
-    st.subheader("Ready for demonstration")
-    st.write(
-        "Choose a role, then click **Run Full Comparison**. "
-        "The application will show both execution paths, the active policy, "
-        "correctness, and measured latency."
-    )
-
-else:
-    correctness: CorrectnessResult = result["correctness"]
-    postgres_stats: BenchmarkStats = result["postgres_stats"]
-    reader_stats: BenchmarkStats = result["reader_stats"]
-
-    st.divider()
-
-    # Experiment summary
-    st.subheader("Experiment Configuration")
-
-    config_col1, config_col2, config_col3 = st.columns(3)
-
-    config_col1.metric(
-        "Role",
-        role.replace("_", " ").title(),
-    )
-
-    config_col2.metric(
-        "Table",
-        "employees",
-    )
-
-    config_col3.metric(
-        "Snapshot",
-        "employees.bin",
-    )
-
-    # Policy
-    st.subheader("Active Row-Level Security Policy")
-
-    try:
-        policy = get_policy_for_role(role)
-        st.json(policy)
-    except Exception as exc:
-        st.error("Could not retrieve the extracted policy.")
-        with st.expander("Technical details"):
-            st.exception(exc)
-
-    # Results
-    st.subheader("Execution Results")
-
-    postgres_rows = result["postgres_rows"]
-    reader_rows = result["reader_rows"]
-
-    postgres_col, reader_col = st.columns(2)
-
-    with postgres_col:
-        st.markdown("### PostgreSQL DBMS")
-
-        st.caption(
-            "The SQL query is executed through PostgreSQL and "
-            "RLS is enforced by the DBMS."
-        )
-
-        if postgres_rows:
-            st.dataframe(
-                pd.DataFrame(postgres_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.warning("No rows returned.")
-
-        st.write(f"Rows returned: **{len(postgres_rows)}**")
-
-    with reader_col:
-        st.markdown("### Direct Reader")
-
-        st.caption(
-            "The Python reader scans the frozen binary snapshot "
-            "and applies the extracted policy locally."
-        )
-
-        if reader_rows:
-            st.dataframe(
-                pd.DataFrame(reader_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.warning("No rows returned.")
-
-        st.write(f"Rows returned: **{len(reader_rows)}**")
-
-    # Correctness
-    st.divider()
-    st.subheader("Correctness Oracle")
-
-    st.caption(
-        "PostgreSQL is the baseline. The direct reader must not return "
-        "forbidden rows or omit rows authorized by PostgreSQL."
-    )
-
-    corr_col1, corr_col2, corr_col3 = st.columns(3)
-
-    with corr_col1:
-        st.metric(
-            "Soundness",
-            "PASS" if correctness.soundness else "FAIL",
-        )
-
-    with corr_col2:
-        st.metric(
-            "Completeness",
-            "PASS" if correctness.completeness else "FAIL",
-        )
-
-    with corr_col3:
-        st.metric(
-            "Results Match",
-            "YES" if correctness.results_match else "NO",
-        )
-
-    if correctness.results_match:
-        st.success(
-            "Correctness check passed: both execution paths returned "
-            "equivalent authorized result sets."
-        )
+import pandas as pd
+import streamlit as st
+from benchmark.benchmark import DEFAULT_QUERY, SUPPORTED_ROLES, benchmark_role, export_binary_snapshot, get_connection, result_record, run_suite
+from database.datasets import generate_dataset, set_demo_threshold
+
+st.set_page_config(page_title='Policy-Aware Direct Snapshot Reader', page_icon=':bar_chart:', layout='wide')
+st.markdown('''<style>
+.path-card {border:1px solid rgba(128,128,128,.25);border-radius:12px;padding:18px;}
+.path-title {font-size:1.1rem;font-weight:650;margin-bottom:14px;}
+.path-flow {font-family:monospace;line-height:1.7;}
+.path-arrow {color:#8caeff;font-size:1.3rem;line-height:1.2;}
+.result-description {min-height:48px;color:#a4a8af;font-size:.9rem;line-height:1.5;margin:0 0 12px;}
+</style>''', unsafe_allow_html=True)
+st.title('Policy-Aware Direct Snapshot Reader')
+st.caption('DBMS semester project | PostgreSQL RLS compared with a Python binary snapshot reader')
+st.caption('Evaluator without PostgreSQL? Run run.cmd demo for the local reader replay, or open demo/index.html for saved evidence.')
+
+
+def database_summary():
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('''SELECT count(*), count(*) FILTER (WHERE g.id IS NOT NULL),
+                                     count(*) FILTER (WHERE e.department IS NULL),
+                                     count(*) FILTER (WHERE e.salary IS NULL)
+                              FROM public.employees e LEFT JOIN public.reader_generated_ids g USING (id)''')
+            total, generated, null_department, null_salary = cursor.fetchone()
+    return dict(total=total, generated=generated, original=total-generated,
+                null_department=null_department, null_salary=null_salary)
+
+try:
+    summary = database_summary()
+except Exception as exc:
+    st.error(f'Could not read the project database: {exc}')
+    st.stop()
+
+if 'notice' in st.session_state:
+    st.success(st.session_state.pop('notice'))
+
+st.sidebar.header('Compare one role')
+role = st.sidebar.selectbox('Role', SUPPORTED_ROLES,
+                           format_func=lambda value: {'it_user':'IT', 'hr_user':'HR', 'finance_user':'Finance'}[value])
+st.sidebar.caption('This chooses whose rows are visible. It does not change the database dataset.')
+with st.sidebar.expander('Timing settings'):
+    warmup_runs = st.number_input('Warm-up runs', min_value=0, max_value=20, value=3,
+                                  help='Untimed repetitions to warm caches before measuring.')
+    measured_runs = st.number_input('Measured runs', min_value=1, max_value=50, value=10,
+                                    help='Timed repetitions used for the average and standard deviation.')
+st.sidebar.divider()
+st.sidebar.metric('Current PostgreSQL rows', f"{summary['total']:,}")
+st.sidebar.caption('Every comparison automatically exports fresh PostgreSQL data. No manual snapshot refresh is needed.')
+
+compare_tab, dataset_tab, batch_tab = st.tabs(['1. Compare results', '2. Change dataset', '3. Batch benchmarks'])
+
+with compare_tab:
+    st.subheader('Compare the current dataset')
+    st.write('Choose a role on the left, then run the comparison. To change how many rows are in PostgreSQL, use the Change dataset tab.')
+    counts = st.columns(3)
+    counts[0].metric('Rows in PostgreSQL', f"{summary['total']:,}")
+    counts[1].metric('Original demo rows', f"{summary['original']:,}")
+    counts[2].metric('Synthetic rows', f"{summary['generated']:,}")
+    st.caption('The generated employees are stored in PostgreSQL first. The binary snapshot is exported from those same database rows.')
+    with st.expander('How the two paths work'):
+        for column, title, steps in zip(st.columns(2), ['PostgreSQL DBMS path', 'Direct reader path'],
+                                       [['SQL query', 'PostgreSQL engine', 'RLS enforcement', 'Authorized result'],
+                                        ['PostgreSQL binary export', 'Binary parser', 'Policy evaluator', 'Authorized result']]):
+            flow = '<div class="path-arrow">&#8595;</div>'.join(f'<div>{step}</div>' for step in steps)
+            column.markdown(f'<div class="path-card"><div class="path-title">{title}</div><div class="path-flow">{flow}</div></div>', unsafe_allow_html=True)
+    with st.expander('Query and measurement details'):
+        st.code(DEFAULT_QUERY, language='sql')
+        st.write('Both paths use the same role, data and extracted policy. Timings include execution and result collection; '
+                 'connection setup, snapshot export, policy extraction and correctness checks are outside the timed region. '
+                 'Warm-ups are untimed. PostgreSQL trials run before reader trials.')
+
+    if st.button('Run comparison', type='primary', width='stretch', key='run_comparison'):
+        st.session_state.pop('benchmark_result', None)
+        try:
+            with st.spinner('Exporting current data, comparing authorized rows, and measuring latency...'):
+                st.session_state['benchmark_result'] = benchmark_role(role, warmup_runs=int(warmup_runs), measured_runs=int(measured_runs))
+        except Exception as exc:
+            st.error(f'The comparison could not be completed: {exc}')
+
+    result = st.session_state.get('benchmark_result')
+    if result is not None and result['role'] != role:
+        result = None
+    if result is None:
+        st.info('Ready: run a comparison to see both result tables, correctness and latency.')
     else:
-        st.error(
-            "Correctness check failed: the two result sets differ."
-        )
+        st.divider()
+        st.subheader('Authorized employee rows')
+        # Headers, descriptions, tables and counts each occupy their own shared row.
+        # Description wrapping therefore cannot shift only one table downward.
+        headings = st.columns(2)
+        headings[0].markdown('### PostgreSQL DBMS')
+        headings[1].markdown('### Direct reader')
+        descriptions = st.columns(2)
+        descriptions[0].markdown('<div class="result-description">PostgreSQL runs the SQL query and applies RLS.</div>', unsafe_allow_html=True)
+        descriptions[1].markdown('<div class="result-description">Python decodes the exported rows and applies the policy.</div>', unsafe_allow_html=True)
+        tables = st.columns(2)
+        for column, rows in zip(tables, [result['postgres_rows'], result['reader_rows']]):
+            column.dataframe(pd.DataFrame(rows[:500], columns=['id','name','department','salary']),
+                             width='stretch', height=350, hide_index=True)
+        returned = st.columns(2)
+        returned[0].caption(f"{len(result['postgres_rows']):,} authorized rows")
+        returned[1].caption(f"{len(result['reader_rows']):,} authorized rows")
+        st.caption('Showing up to 500 rows per table. Every returned row is included in the correctness check.')
 
-        mismatch_col1, mismatch_col2 = st.columns(2)
+        correctness = result['correctness']
+        st.subheader('Correctness')
+        checks = st.columns(3)
+        checks[0].metric('No extra rows (soundness)', 'PASS' if correctness.soundness else 'FAIL')
+        checks[1].metric('No missing rows (completeness)', 'PASS' if correctness.completeness else 'FAIL')
+        checks[2].metric('All row values match', 'YES' if correctness.results_match else 'NO')
+        if correctness.results_match:
+            st.success('Both paths returned the same authorized rows and field values.')
+        else:
+            st.error('The results differ. Treat these performance numbers as an invalid correctness case.')
+            with st.expander('Rows that differ'):
+                st.write('PostgreSQL-only rows', correctness.postgres_only_rows)
+                st.write('Reader-only rows', correctness.reader_only_rows)
+        with st.expander('Policy and reader scan details'):
+            st.json(result['policy'])
+            scans = st.columns(3)
+            for col, title, key in zip(scans, ['Scanned','Returned','Denied'], ['rows_scanned','rows_returned','rows_denied']):
+                col.metric(title, f"{result[key]:,}")
+            st.caption(f"Policy extraction took {result['policy_resolution_ms']:.3f} ms, outside the scan timings.")
 
-        with mismatch_col1:
-            st.markdown("#### PostgreSQL-only rows")
-            if correctness.postgres_only_rows:
-                st.dataframe(
-                    pd.DataFrame(correctness.postgres_only_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.write("None")
+        st.subheader('Measured performance')
+        pg, reader = result['postgres_stats'], result['reader_stats']
+        timing = st.columns(3)
+        timing[0].metric('PostgreSQL average', f'{pg.average_ms:.3f} ms')
+        timing[1].metric('Reader average', f'{reader.average_ms:.3f} ms')
+        ratio = result['speedup']
+        timing[2].metric('PostgreSQL / reader latency', f'{ratio:.3f}x')
+        if ratio >= 1:
+            st.write(f'The reader was {ratio:.2f} times faster in this measurement.')
+        else:
+            st.write(f'PostgreSQL was {1/ratio:.2f} times faster in this measurement.')
+        frame = pd.DataFrame([{'Path':'PostgreSQL', 'Average ms':pg.average_ms, 'Standard deviation ms':pg.standard_deviation_ms},
+                              {'Path':'Direct reader', 'Average ms':reader.average_ms, 'Standard deviation ms':reader.standard_deviation_ms}])
+        st.bar_chart(frame.set_index('Path')[['Average ms']])
+        st.caption('Lower latency is better. A small dataset can favor Python; larger scans can favor PostgreSQL. This is a measured result, not a guaranteed speedup.')
+        with st.expander('Timing samples and CSV export'):
+            st.dataframe(frame, hide_index=True)
+            st.write('This CSV contains one summary row for this role and dataset: timings, row counts, policy and correctness. It does not export the employee table.')
+            record = dict(result_record(result), policy_ast=json.dumps(result['policy']),
+                          null_department_rows=result['null_department_rows'], null_salary_rows=result['null_salary_rows'])
+            st.download_button('Download comparison summary (CSV)', pd.DataFrame([record]).to_csv(index=False), 'comparison_summary.csv', 'text/csv')
 
-        with mismatch_col2:
-            st.markdown("#### Direct-reader-only rows")
-            if correctness.reader_only_rows:
-                st.dataframe(
-                    pd.DataFrame(correctness.reader_only_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.write("None")
+with dataset_tab:
+    st.subheader('Change the data used in the demonstration')
+    st.write(f"PostgreSQL currently contains **{summary['total']:,} employees**: **{summary['original']:,} original** and **{summary['generated']:,} synthetic** rows.")
+    st.write('Use this only when you want a different dataset size or access rule. Applying it writes synthetic employees into PostgreSQL, '
+             'updates the three demo policies, and exports employees.bin. Then return to Compare results.')
+    st.caption(f"Current NULL values: {summary['null_department']:,} departments and {summary['null_salary']:,} salaries. "
+               'Rows with NULL policy attributes may be denied by SQL comparisons.')
+    sizes = [10, 1000, 10000, 100000, 1000000]
+    with st.form('dataset'):
+        total_rows = st.selectbox('Total employee rows', sizes, index=sizes.index(summary['total']) if summary['total'] in sizes else 2)
+        null_percent = st.slider('Generated rows with missing department or salary (%)', 0, 25, 5,
+                                 help='Applies separately to each column in the generated rows. Original rows are preserved.')
+        threshold = st.selectbox('Access rule for every role', [0, 70000, 100000],
+                                 format_func=lambda n: 'Own department only' if n == 0 else f'Own department and salary at least {n:,}')
+        apply_dataset = st.form_submit_button('Apply dataset and access rule')
+    st.caption('Original rows are preserved. Only synthetic rows previously created by this generator are replaced. '
+               'This changes the data; it does not run a timed comparison.')
+    if apply_dataset:
+        try:
+            with st.spinner('Writing synthetic employees into PostgreSQL and exporting the snapshot...'):
+                with get_connection() as connection:
+                    count = generate_dataset(connection, total_rows, null_percent)
+                    set_demo_threshold(connection, threshold)
+                export_binary_snapshot()
+            st.session_state.pop('benchmark_result', None)
+            st.session_state['notice'] = f'Dataset updated: {count:,} employees. Open Compare results and click Run comparison.'
+            st.rerun()
+        except Exception as exc:
+            st.error(f'Dataset update failed: {exc}')
 
-    # Performance
-    st.divider()
-    st.subheader("Performance")
+with batch_tab:
+    st.subheader('Run the 27-case research benchmark')
+    st.write('This optional batch is for your submission report. It automatically tests all three roles, '
+             '1,000 / 10,000 / 100,000 rows, and three salary rules. You do not need to change the dataset manually first.')
+    st.info('Batch changes are temporary. Your current demonstration data and policies are restored afterward.')
+    st.caption('Uses 2 warm-ups and 5 timed runs per path for each case. The sidebar timing settings apply only to single comparisons.')
+    if st.button('Run all 27 benchmark cases', key='run_batch'):
+        st.session_state.pop('suite_records', None)
+        try:
+            progress = st.progress(0)
+            with st.spinner('Measuring 27 cases; this may take a minute...'):
+                st.session_state['suite_records'] = run_suite(progress=lambda n,total: progress.progress(n/total))
+            st.success('Saved the CSV, raw timing samples and submission report. Your demonstration dataset is unchanged.')
+        except Exception as exc:
+            st.error(f'Batch benchmark failed: {exc}')
+    records = st.session_state.get('suite_records')
+    if records is None:
+        saved = PROJECT_ROOT / 'results' / 'benchmark_results.csv'
+        if saved.exists():
+            records = pd.read_csv(saved).to_dict('records')
+            st.caption('Showing previously saved batch results. Run the batch again to replace them.')
+    if records:
+        frame = pd.DataFrame(records)
+        st.dataframe(frame, hide_index=True)
+        st.download_button('Download all benchmark cases (CSV)', frame.to_csv(index=False), 'benchmark_results.csv', 'text/csv')
+        st.line_chart(frame[frame.minimum_salary == 0].pivot(index='dataset_size', columns='role', values='speedup'))
+        st.caption('Ratio above 1 favors the reader; below 1 favors PostgreSQL.')
 
-    perf_col1, perf_col2, perf_col3 = st.columns(3)
-
-    with perf_col1:
-        st.metric(
-            "PostgreSQL average",
-            f"{postgres_stats.average_ms:.3f} ms",
-        )
-
-    with perf_col2:
-        st.metric(
-            "Direct Reader average",
-            f"{reader_stats.average_ms:.3f} ms",
-        )
-
-    with perf_col3:
-        st.metric(
-            "Speedup",
-            f"{result['speedup']:.3f}x",
-        )
-
-    timing_df = pd.DataFrame(
-        [
-            {
-                "Path": "PostgreSQL",
-                "Average latency (ms)": postgres_stats.average_ms,
-                "Std. deviation (ms)": postgres_stats.standard_deviation_ms,
-            },
-            {
-                "Path": "Direct Reader",
-                "Average latency (ms)": reader_stats.average_ms,
-                "Std. deviation (ms)": reader_stats.standard_deviation_ms,
-            },
-        ]
-    )
-
-    st.dataframe(
-        timing_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.markdown("### Average latency comparison")
-
-    chart_df = timing_df.set_index("Path")[["Average latency (ms)"]]
-    st.bar_chart(chart_df)
-
-    # Interpretation
-    st.subheader("Measured Interpretation")
-
-    if result["speedup"] > 1:
-        st.write(
-            f"For this measured case, the direct reader had lower average "
-            f"latency, with a measured ratio of {result['speedup']:.3f}x."
-        )
-    elif result["speedup"] < 1:
-        st.write(
-            f"For this measured case, the direct reader had higher average "
-            f"latency, with a measured ratio of {result['speedup']:.3f}x."
-        )
-    else:
-        st.write(
-            "For this measured case, the two execution paths had "
-            "approximately equal average latency."
-        )
-
-    st.caption(
-        "This result describes the selected dataset and role only; "
-        "it is not a general performance claim."
-    )
-
-    with st.expander("Current prototype scope"):
-        st.write(
-            "Read-only, single-table execution over a frozen PostgreSQL "
-            "binary COPY snapshot with the supported row-level policy grammar. "
-            "Live heap parsing, joins, writes, concurrent updates, masking, "
-            "auditing, arbitrary policy expressions, and LLM-generated heap "
-            "parsing are outside this first version."
-        )
+st.caption('Scope: trusted local demo; one table, read-only queries, frozen binary COPY snapshots and a restricted policy grammar. No live heap-page parsing.')

@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.venv-run/
 venv/
 ENV/
 
@@ -28,3 +29,9 @@ Thumbs.db
 
 # Local logs
 *.log
+
+.test-tmp*/
+.test-cache/
+/data/reader-experiment-*/
+
+/tmp/

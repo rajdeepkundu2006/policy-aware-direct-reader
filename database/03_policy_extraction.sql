@@ -1,18 +1,10 @@
--- database/03_policy_extraction.sql
-
--- Extract the RLS policies defined by PostgreSQL for employees.
--- The policy expression is reconstructed using pg_get_expr().
--- Role OIDs are converted to PostgreSQL role names.
-
-SELECT
-    p.polname,
-    p.polcmd,
-    r.rolname AS role_name,
-    pg_get_expr(p.polqual, p.polrelid) AS using_expr
-FROM pg_policy AS p
-JOIN LATERAL unnest(p.polroles) AS policy_role(role_oid)
-    ON TRUE
-JOIN pg_roles AS r
-    ON r.oid = policy_role.role_oid
-WHERE p.polrelid = 'employees'::regclass
+﻿-- Inspect explicit policy assignments, including PUBLIC and command/composition.
+-- Runtime extraction in policy_ast.py additionally resolves inherited privileges.
+SELECT p.polname, p.polcmd, p.polpermissive,
+       CASE WHEN assigned.role_oid = 0 THEN 'PUBLIC' ELSE r.rolname END AS role_name,
+       COALESCE(pg_get_expr(p.polqual, p.polrelid), 'true') AS using_expr
+FROM pg_policy p
+CROSS JOIN LATERAL unnest(p.polroles) AS assigned(role_oid)
+LEFT JOIN pg_roles r ON r.oid = assigned.role_oid
+WHERE p.polrelid = 'public.employees'::regclass
 ORDER BY p.polname;
