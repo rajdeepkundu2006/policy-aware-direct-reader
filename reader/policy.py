@@ -10,6 +10,29 @@ SUPPORTED_COMPARISON_OPERATORS = {"=", "<", "<=", ">", ">="}
 SUPPORTED_LOGICAL_OPERATORS = {"AND", "OR"}
 
 
+def compile_policy(policy):
+    """Validate all branches once and bind tuple indexes and operators."""
+    import operator
+    from reader.query import COLUMNS
+    validate_policy(policy)
+    operations = {'=': operator.eq, '<': operator.lt, '<=': operator.le, '>': operator.gt, '>=': operator.ge}
+    def build(node):
+        if node['type'] == 'constant':
+            value = node['value']
+            return lambda row: value
+        if node['type'] == 'comparison':
+            index, expected = COLUMNS.index(node['column']), node['value']
+            compare = operations[node['operator']]
+            if expected is None:
+                return lambda row: False
+            return lambda row: row[index] is not None and compare(row[index], expected)
+        left, right = build(node['left']), build(node['right'])
+        if node['operator'] == 'AND':
+            return lambda row: left(row) and right(row)
+        return lambda row: left(row) or right(row)
+    return build(policy)
+
+
 def validate_policy(policy):
     """Validate every branch before any rows are released."""
     if not isinstance(policy, dict):

@@ -10,8 +10,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import pandas as pd
 import streamlit as st
-from benchmark.benchmark import DEFAULT_QUERY, SUPPORTED_ROLES, benchmark_role, export_binary_snapshot, get_connection, result_record, run_suite
+from benchmark.benchmark import SUPPORTED_ROLES, benchmark_role, export_binary_snapshot, get_connection, result_record, run_suite
 from database.datasets import generate_dataset, set_demo_threshold
+from reader.query import QuerySpec, COLUMNS
 
 st.set_page_config(page_title='Policy-Aware Direct Snapshot Reader', page_icon=':bar_chart:', layout='wide')
 st.markdown('''<style>
@@ -73,22 +74,44 @@ with compare_tab:
                                         ['PostgreSQL binary export', 'Binary parser', 'Policy evaluator', 'Authorized result']]):
             flow = '<div class="path-arrow">&#8595;</div>'.join(f'<div>{step}</div>' for step in steps)
             column.markdown(f'<div class="path-card"><div class="path-title">{title}</div><div class="path-flow">{flow}</div></div>', unsafe_allow_html=True)
+    with st.expander('Query controls', expanded=True):
+        selected_columns = st.multiselect('Returned columns', COLUMNS, default=list(COLUMNS), key='query_columns')
+        salary_columns = st.columns(2)
+        with salary_columns[0]:
+            use_minimum = st.checkbox('Minimum salary', key='use_minimum')
+            minimum = st.number_input('Salary at least', min_value=-2147483648, max_value=2147483647,
+                                      value=0, disabled=not use_minimum, key='query_minimum')
+        with salary_columns[1]:
+            use_maximum = st.checkbox('Maximum salary', key='use_maximum')
+            maximum = st.number_input('Salary at most', min_value=-2147483648, max_value=2147483647,
+                                      value=120000, disabled=not use_maximum, key='query_maximum')
+        exact_name = st.text_input('Exact employee name', key='query_name', help='Empty means any name. Matching is case-sensitive.')
+        row_limit = st.number_input('Maximum returned rows', min_value=0, max_value=1000000, value=0,
+                                   key='query_limit', help='0 means all matching rows. Results are ordered by employee ID.')
+    query = None
+    try:
+        query = QuerySpec(tuple(selected_columns), minimum if use_minimum else None,
+                          maximum if use_maximum else None, exact_name if exact_name else None,
+                          row_limit if row_limit else None)
+    except ValueError as exc:
+        st.error(str(exc))
     with st.expander('Query and measurement details'):
-        st.code(DEFAULT_QUERY, language='sql')
+        if query is not None:
+            st.code(query.sql(literals=True)[0].as_string(), language='sql')
         st.write('Both paths use the same role, data and extracted policy. Timings include execution and result collection; '
-                 'connection setup, snapshot export, policy extraction and correctness checks are outside the timed region. '
+                 'connection setup, snapshot export, policy extraction, predicate preparation and correctness checks are outside the timed region. '
                  'Warm-ups are untimed. PostgreSQL trials run before reader trials.')
 
-    if st.button('Run comparison', type='primary', width='stretch', key='run_comparison'):
+    if st.button('Run comparison', type='primary', width='stretch', key='run_comparison', disabled=query is None):
         st.session_state.pop('benchmark_result', None)
         try:
             with st.spinner('Exporting current data, comparing authorized rows, and measuring latency...'):
-                st.session_state['benchmark_result'] = benchmark_role(role, warmup_runs=int(warmup_runs), measured_runs=int(measured_runs))
+                st.session_state['benchmark_result'] = benchmark_role(role, warmup_runs=int(warmup_runs), measured_runs=int(measured_runs), query=query)
         except Exception as exc:
             st.error(f'The comparison could not be completed: {exc}')
 
     result = st.session_state.get('benchmark_result')
-    if result is not None and result['role'] != role:
+    if result is not None and (result['role'] != role or query is None or result.get('query') != query.as_dict()):
         result = None
     if result is None:
         st.info('No comparison results.')
@@ -105,7 +128,7 @@ with compare_tab:
         descriptions[1].markdown('<div class="result-description">Python decodes the exported rows and applies the policy.</div>', unsafe_allow_html=True)
         tables = st.columns(2)
         for column, rows in zip(tables, [result['postgres_rows'], result['reader_rows']]):
-            column.dataframe(pd.DataFrame(rows[:500], columns=['id','name','department','salary']),
+            column.dataframe(pd.DataFrame(rows[:500], columns=result['query']['columns']),
                              width='stretch', height=350, hide_index=True)
         returned = st.columns(2)
         returned[0].caption(f"{len(result['postgres_rows']):,} authorized rows")
@@ -127,9 +150,10 @@ with compare_tab:
                 st.write('Reader-only rows', correctness.reader_only_rows)
         with st.expander('Policy and reader scan details'):
             st.json(result['policy'])
-            scans = st.columns(3)
-            for col, title, key in zip(scans, ['Scanned','Returned','Denied'], ['rows_scanned','rows_returned','rows_denied']):
+            scans = st.columns(5)
+            for col, title, key in zip(scans, ['Scanned','Returned','Denied by RLS','Query filtered','Limit excluded'], ['rows_scanned','rows_returned','rows_denied','rows_filtered','rows_limited']):
                 col.metric(title, f"{result[key]:,}")
+            st.caption(f"Predicate preparation: {result['reader_preparation_ms']:.3f} ms. Reference reader match: {'YES' if result['reference_match'] else 'NO'}.")
             st.caption(f"Policy extraction took {result['policy_resolution_ms']:.3f} ms, outside the scan timings.")
 
         st.subheader('Measured performance')

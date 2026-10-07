@@ -29,7 +29,8 @@ import psycopg
 from psycopg import sql
 
 from database.policy_ast import extract_policies_from_database
-from reader.snapshot_reader import read_snapshot
+from reader.snapshot_reader import read_snapshot, read_snapshot_reference, PreparedReader
+from reader.query import QuerySpec
 
 from config import connection_settings
 from database.policy_ast import extract_policies_from_connection
@@ -94,11 +95,12 @@ def _validate_role(role: str) -> None:
 
 def _execute_postgres_query(
     connection: psycopg.Connection,
-    query: str,
+    query,
+    params=None,
 ) -> list[dict[str, Any]]:
     """Execute a query on an already-role-scoped PostgreSQL connection."""
     with connection.cursor() as cursor:
-        cursor.execute(cast(Any, query))
+        cursor.execute(cast(Any, query), params)
         rows = cursor.fetchall()
         if cursor.description is None:
             raise RuntimeError(
@@ -114,7 +116,7 @@ def _execute_postgres_query(
 
 def run_postgres_query(
     role: str,
-    query: str = DEFAULT_QUERY,
+    query: str | QuerySpec = DEFAULT_QUERY,
 ) -> list[dict[str, Any]]:
     """
     Execute the DBMS baseline under the requested RLS role.
@@ -130,6 +132,9 @@ def run_postgres_query(
                 sql.SQL("SET ROLE {}").format(sql.Identifier(role))
             )
 
+        if isinstance(query, QuerySpec):
+            statement, parameters = query.sql()
+            return _execute_postgres_query(connection, statement, parameters)
         return _execute_postgres_query(connection, query)
 
 
@@ -163,10 +168,11 @@ def compare_results(
 
     Results match only when both conditions hold.
     """
-    postgres = normalize_rows(postgres_rows)
-    reader = normalize_rows(reader_rows)
-
-    columns = ('id', 'name', 'department', 'salary')
+    postgres = list(postgres_rows)
+    reader = list(reader_rows)
+    columns = tuple(sorted(set().union(*(row.keys() for row in postgres + reader))))
+    if any(set(row) != set(columns) for row in postgres + reader):
+        raise ValueError('Result rows have inconsistent columns')
     postgres_counts = Counter(tuple(row[c] for c in columns) for row in postgres)
     reader_counts = Counter(tuple(row[c] for c in columns) for row in reader)
     postgres_only = [dict(zip(columns, row)) for row, count in (postgres_counts - reader_counts).items() for _ in range(count)]
@@ -253,6 +259,7 @@ def _export_from_connection(connection, snapshot_path):
 def run_direct_reader(
     role: str,
     snapshot_path: str | Path = DEFAULT_SNAPSHOT_PATH,
+    query: QuerySpec | None = None,
 ) -> list[dict[str, Any]]:
     """Extract the role policy and run Ishaan's direct reader."""
     policy = get_policy_for_role(role)
@@ -260,6 +267,7 @@ def run_direct_reader(
     return read_snapshot(
         str(snapshot_path),
         policy,
+        query,
     )
 
 
@@ -319,6 +327,7 @@ def benchmark_role(
     warmup_runs: int = 3,
     measured_runs: int = 10,
     connection=None,
+    query: QuerySpec | None = None,
 ) -> dict[str, Any]:
     """
     Run one complete benchmark case for a role.
@@ -327,6 +336,8 @@ def benchmark_role(
     PostgreSQL and reader results are also validated before timing.
     """
     _validate_role(role)
+    query = query or QuerySpec()
+    statement, parameters = query.sql()
     snapshot_path = Path(snapshot_path)
     (PROJECT_ROOT / 'data').mkdir(exist_ok=True)
 
@@ -355,23 +366,27 @@ def benchmark_role(
             shutil.copyfile(experiment_snapshot, snapshot_path)
             with connection.cursor() as cursor:
                 cursor.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
-            postgres_rows = _execute_postgres_query(connection, DEFAULT_QUERY)
-
-            reader_rows = read_snapshot(
-                str(experiment_snapshot),
-                policy,
-            )
+            postgres_rows = _execute_postgres_query(connection, statement, parameters)
+            preparation_start = time.perf_counter()
+            prepared = PreparedReader(policy, query)
+            reader_preparation_ms = (time.perf_counter() - preparation_start) * 1000
+            scan = prepared.scan(str(experiment_snapshot))
+            reader_rows = scan.rows
+            reference_rows = read_snapshot_reference(str(experiment_snapshot), policy, query)
+            reference_match = reader_rows == reference_rows
+            if not reference_match:
+                raise RuntimeError('Optimized reader differs from the reference reader.')
 
             correctness = compare_results(postgres_rows, reader_rows)
 
             postgres_stats = benchmark_callable(
-                lambda: _execute_postgres_query(connection, DEFAULT_QUERY),
+                lambda: _execute_postgres_query(connection, statement, parameters),
                 warmup_runs=warmup_runs,
                 measured_runs=measured_runs,
             )
 
             reader_stats = benchmark_callable(
-                lambda: read_snapshot(str(experiment_snapshot), policy),
+                lambda: prepared.scan(str(experiment_snapshot)),
                 warmup_runs=warmup_runs,
                 measured_runs=measured_runs,
             )
@@ -393,7 +408,12 @@ def benchmark_role(
         "null_department_rows": null_department_rows,
         "null_salary_rows": null_salary_rows,
         "rows_returned": len(reader_rows),
-        "rows_denied": rows_scanned - len(reader_rows),
+        "rows_denied": scan.denied,
+        "rows_filtered": scan.filtered,
+        "rows_limited": scan.limited,
+        "query": query.as_dict(),
+        "reference_match": reference_match,
+        "reader_preparation_ms": reader_preparation_ms,
         "postgres_rows": postgres_rows,
         "reader_rows": reader_rows,
         "correctness": correctness,
@@ -406,7 +426,9 @@ def benchmark_role(
 CSV_COLUMNS = ['dataset_size', 'role', 'minimum_salary', 'null_percent', 'visible_rows',
                'selectivity', 'postgres_avg_ms', 'postgres_stddev_ms', 'reader_avg_ms',
                'reader_stddev_ms', 'speedup', 'policy_resolution_ms', 'warmup_runs',
-               'measured_runs', 'soundness', 'completeness', 'results_match']
+               'measured_runs', 'soundness', 'completeness', 'results_match',
+               'query_minimum_salary', 'query_maximum_salary', 'exact_name', 'selected_columns',
+               'row_limit', 'rows_denied', 'rows_filtered', 'rows_limited', 'reader_preparation_ms', 'reference_match']
 
 
 def result_record(result, minimum_salary=None, null_percent=None):
@@ -420,7 +442,12 @@ def result_record(result, minimum_salary=None, null_percent=None):
                 speedup=result['speedup'], policy_resolution_ms=result['policy_resolution_ms'],
                 warmup_runs=result.get('warmup_runs', 3), measured_runs=len(pg.samples_ms),
                 soundness=correctness.soundness, completeness=correctness.completeness,
-                results_match=correctness.results_match)
+                results_match=correctness.results_match,
+                query_minimum_salary=result['query']['minimum_salary'],
+                query_maximum_salary=result['query']['maximum_salary'], exact_name=result['query']['exact_name'],
+                selected_columns=','.join(result['query']['columns']), row_limit=result['query']['limit'],
+                rows_denied=result['rows_denied'], rows_filtered=result['rows_filtered'], rows_limited=result['rows_limited'],
+                reader_preparation_ms=result['reader_preparation_ms'], reference_match=result['reference_match'])
 
 
 def save_records(records, path=None):

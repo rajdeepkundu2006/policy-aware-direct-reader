@@ -1,4 +1,4 @@
-﻿# Policy-Aware Direct Snapshot Reader
+# Policy-Aware Direct Snapshot Reader
 
 Python and PostgreSQL prototype for comparing row-level security with local filtering of a frozen binary COPY snapshot.
 
@@ -32,7 +32,7 @@ python3 -m venv .venv
 
 ## Application
 
-- **Comparison:** PostgreSQL executes a SELECT under IT, HR or Finance role. Python scans a fresh binary export and applies the extracted policy. The interface displays both result tables, full-row correctness and repeated timing statistics.
+- **Comparison:** PostgreSQL executes a SELECT under IT, HR or Finance role. Python scans a fresh binary export and applies the extracted policy. Query controls provide inclusive salary bounds, case-sensitive exact name matching, selected output columns and a row limit. Both paths order by employee ID, apply RLS and query filters before limiting, and return identical projections. The interface displays both result tables, value/duplicate correctness and repeated timing statistics.
 - **Dataset:** Configure synthetic row count, NULL percentage and a department/salary access rule. Original rows are preserved; previously generated rows are replaced.
 - **Benchmarks:** Measure three roles, three dataset sizes and three salary thresholds. Data and policy changes are rolled back. CSV summaries and raw samples are written to the ignored `results/` directory.
 
@@ -54,7 +54,7 @@ python3 -m venv .venv
 |---|---|
 | `config.py`, `manage.py`, `run.cmd` | Local configuration and launch commands |
 | `database/` | Schema, RLS policies, catalog extraction and synthetic datasets |
-| `reader/` | Binary COPY decoding, policy validation and filtering |
+| `reader/` | Buffered binary COPY decoding, compiled policies, shared query requests and a reference reader |
 | `benchmark/` | PostgreSQL baseline, correctness comparison and timing |
 | `app/` | Streamlit interface |
 | `tests/` | Unit, UI and PostgreSQL integration tests |
@@ -65,11 +65,13 @@ One table, read-only queries and a frozen PostgreSQL binary COPY export. Policie
 
 Live comparisons use a repeatable-read transaction and table lock so the export, policies and baseline agree. Complete values and duplicate counts are compared; matching IDs alone are insufficient. The parser requires the four-column employees schema, UTF8 and deterministic text collations.
 
+The optimized decoder loads the binary file into memory, decodes integers directly by offset, caches repeated department strings and constructs dictionaries only for returned rows. It validates the entire stream, including rows beyond the limit. The reader scans all rows and orders matches before applying the limit; PostgreSQL may use indexes or stop earlier. Memory usage scales with snapshot size and matching rows.
+
 The role selector assumes a trusted local operator. Raw snapshot filesystem access, authentication, live heap pages, joins and arbitrary SQL policies are outside this prototype.
 
 ## Timing
 
-Both paths include result collection. Connection setup, role switching, export, policy extraction and correctness checks are excluded from timed scans. Policy extraction is reported separately. PostgreSQL sorts by primary key; the export is ordered before timed reader scans. Warm-ups warm caches, and PostgreSQL trials precede reader trials. Performance depends on dataset size, policy and machine conditions.
+Both paths include result collection. Connection setup, role switching, export, policy extraction, predicate preparation and correctness checks are excluded from timed scans. Policy extraction and predicate preparation are reported separately. Predicates are validated and compiled once per comparison, then reused across timed scans. Each case also checks the optimized output against the original streaming decoder and recursive evaluator, outside timing. PostgreSQL sorts by primary key; the export is ordered before timed reader scans. Warm-ups warm caches, and PostgreSQL trials precede reader trials. Performance depends on dataset size, policy and machine conditions.
 
 ## Tests
 
